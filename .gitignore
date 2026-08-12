@@ -223,3 +223,6 @@ LOneGripper/wifi_secrets.py
 # CyberBrick L-ONE: on-device runtime logs
 LOneGripper/log/
 LOneRC/log/
+
+# CyberBrick L-ONE: collected demonstration data (large, per-machine)
+datasets/

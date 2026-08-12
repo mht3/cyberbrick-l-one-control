@@ -1,62 +1,10 @@
 #!/usr/bin/env python3
 """Virtual controller GUI for the CyberBrick L-ONE arm.
-
-Two transports, picked with the USB/WiFi toggle in the connection bar
-(USB is the default):
-
-- USB: talks to the board's MicroPython raw REPL over the selected
-  serial port and calls ServosControllerExecMapper /
-  MotorsControllerExecMapper (from
-  CyberBrick_Controller_Core/src/app_rc/app/control.py) directly, so
-  commands get EXEC-level priority over the RC transmitter's
-  BEHAVIOR-level control. Entering the raw REPL interrupts whatever is
-  currently running on the board, so the physical remote won't respond
-  while connected. Disconnecting hard-resets the board (machine.reset(),
-  not a soft Ctrl-D reset -- needed for a clean radio if this interrupted
-  a live RC/ESP-NOW session), restoring the remote automatically.
-
-- WiFi: purely a TCP client of wifi_bridge.py (LOneGripper/wifi_bridge.py,
-  a small on-device TCP server) -- this GUI never touches USB or configures
-  the board's WiFi in any way. Getting the board into WiFi mode in the
-  first place is entirely the board's own doing: rc_main.py's boot-time
-  watchdog (LOneGripper/app/rc_main.py, NO_PAIRING_FALLBACK_TIMEOUT) falls
-  back to WiFi mode on its own after 15s with no RC transmitter paired
-  (or power-cycle the board with no transmitter in range to trigger this
-  sooner), at which point boot.py (LOneGripper/boot.py) launches
-  wifi_bridge.py instead of the stock RC firmware. wifi_bridge.py tries
-  joining STA_SSID (wifi_secrets.py, e.g. UCSD-DEVICE) first and only
-  falls back to hosting its own AP (AP_SSID/AP_PASSWORD, fixed IP
-  192.168.4.1) if that's unavailable. The STA IP itself is DHCP-assigned
-  (not static), but UCSD-DEVICE registers devices by MAC address and hands
-  back a stable DNS name for it regardless of which IP it gets each time
-  (confirmed via `nslookup` -- see STA_HOSTNAME), so the Host field
-  defaults to that hostname rather than chasing the IP. The AP Mode toggle
-  in the connection bar (off by default) is a shortcut for the fixed
-  192.168.4.1 fallback case: flips the Host field to it and logs a reminder
-  to join the board's own AP network (AP_SSID/AP_PASSWORD) from your
-  computer's WiFi settings yourself -- the GUI still never configures WiFi
-  on the board. While wifi_bridge.py is the board's running program, it --
-  not the stock RC firmware -- owns the board, so the remote is inactive.
-  Disconnecting sends RESET over the WiFi link, which deletes the flag
-  and resets the board back to the normal RC firmware, restoring the
-  remote.
-
-Keyboard: comma/period drive the Base motor, W/S or Up/Down drive the
-Upper Arm, A/D or Left/Right drive the Lower Arm, and Space toggles the
-gripper -- these
-mirror the on-screen hold buttons (JointControl merges whichever of
-mouse/keyboard are currently held per joint, so releasing one doesn't stop
-a joint the other is still holding). Keys are ignored while the Host field
-has focus, so typing a hostname there doesn't drive the arm.
-
-Channel mapping and speed/angle ranges below come from Robotic arm.json
-and control.py, cross-checked against bbl/motors.py and bbl/servos.py
-pulled from the device.
-
-Requires: pip install pyserial
 """
 
 import glob
+import importlib.util
+import os
 import queue
 import socket
 import sys
@@ -100,24 +48,30 @@ KEY_JOINTS = {
 GRIPPER_KEY = "space"
 
 WIFI_PORT = 8266
-# UCSD-DEVICE registers this board by MAC address and hands back this DNS
-# name on every STA connect regardless of the (DHCP, non-static) IP it gets
-# -- confirmed stable via `nslookup mpy-esp32c3.dynamic.ucsd.edu` and the
-# matching reverse lookup. Used as the Host field's default so there's no
-# IP to chase.
-STA_HOSTNAME = "mpy-esp32c3.dynamic.ucsd.edu"
-# wifi_bridge.py's start_ap() fixed AP address (see LOneGripper/wifi_bridge.py) --
-# the fallback host if STA isn't reachable, and used to guess AP vs. STA for
-# the "Join UCSD" button.
-AP_FIXED_IP = "192.168.4.1"
-# Display-only, for the AP Mode log reminder -- must match wifi_secrets.py
-# on the board. The GUI never sends WiFi credentials anywhere; you still
-# join this network yourself from your computer's WiFi settings.
-AP_SSID = "4254-LOneGripper"
-AP_PASSWORD = "lajolla4254"
 
-# A light, neutral palette applied via ttk's "clam" theme (the default
-# per-platform theme, e.g. macOS's "aqua", ignores most color options).
+
+def _load_wifi_secrets():
+    """Loads LOneGripper/wifi_secrets.py by path (gitignored -- see wifi_secrets.example.py)."""
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(repo_dir, "LOneGripper", "wifi_secrets.py")
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"{path} not found -- copy LOneGripper/wifi_secrets.example.py to "
+            "LOneGripper/wifi_secrets.py and fill in your AP/STA hostname, IP, "
+            "SSID, and password."
+        )
+    spec = importlib.util.spec_from_file_location("_lone_wifi_secrets", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_wifi_secrets = _load_wifi_secrets()
+STA_HOSTNAME = _wifi_secrets.STA_HOSTNAME
+AP_FIXED_IP = _wifi_secrets.AP_FIXED_IP
+AP_SSID = _wifi_secrets.AP_SSID
+AP_PASSWORD = _wifi_secrets.AP_PASSWORD
+
 PALETTE = {
     "bg": "#f4f5f7",
     "border": "#d7dbe0",
@@ -454,11 +408,6 @@ class ControllerApp(tk.Tk):
         bar = ttk.Frame(self, padding=(16, 12))
         bar.pack(fill="x")
 
-        # No "Remote" option -- interrupting a live ESP-NOW session over USB
-        # and soft-resetting back to it isn't reliable (same root cause as
-        # the old STA-connect radio stall). Power-cycling the board is the
-        # supported way back to RC mode; rc_main.py's own boot-time watchdog
-        # (NO_PAIRING_FALLBACK_TIMEOUT) decides RC vs. WiFi from there.
         self.mode_var = tk.StringVar(value="")
         self.serial_radio = ttk.Radiobutton(
             bar, text="Serial", variable=self.mode_var, value="serial",

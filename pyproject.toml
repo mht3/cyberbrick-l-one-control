@@ -3,17 +3,23 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cyberbrick"
+name = "cyberbrick-l-one-control"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "numpy", "tqdm", "pygame", "matplotlib",
     "wandb", "tensorboard", "scipy", "torch>=2.7", "torchvision",
-    "scikit-learn", "pyserial",
+    "scikit-learn", "pyserial", "opencv-python", "pillow", "zarr",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ipykernel"]
+
+[tool.setuptools]
+py-modules = ["virtual_gripper", "collect_data", "inspect_dataset", "visualize_episode"]
+
+[tool.setuptools.packages.find]
+include = ["lone_data*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
