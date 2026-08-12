@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CyberBrick L-ONE: real WiFi credentials (see wifi_secrets.example.py)
+LOneGripper/wifi_secrets.py
+
+# CyberBrick L-ONE: on-device runtime logs
+LOneGripper/log/
+LOneRC/log/

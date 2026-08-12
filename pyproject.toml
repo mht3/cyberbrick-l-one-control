@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyberbrick"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy", "tqdm", "pygame", "matplotlib",
+    "wandb", "tensorboard", "scipy", "torch>=2.7", "torchvision",
+    "scikit-learn", "pyserial",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ipykernel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
