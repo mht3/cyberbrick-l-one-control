@@ -1,7 +1,7 @@
 # cyberbrick-l-one-control
 Custom control modules for the [CyberBrick L-One](https://us.store.bambulab.com/products/l-one-desktop-robotic-arm-cyberbrick-rc).
 
-![L-One Robot Arm](assets/l_one.png)
+<img src="assets/l_one.png" alt="L-One Robot Arm" width="300">
 
 
 ## Getting Started
