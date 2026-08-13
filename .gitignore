@@ -226,3 +226,7 @@ LOneRC/log/
 
 # CyberBrick L-ONE: collected demonstration data (large, per-machine)
 datasets/
+
+# LeRobot datasets and collection session logs
+data/
+logs/

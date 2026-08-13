@@ -9,14 +9,16 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy", "tqdm", "pygame", "matplotlib",
     "wandb", "tensorboard", "scipy", "torch>=2.7", "torchvision",
-    "scikit-learn", "pyserial", "opencv-python", "pillow", "zarr",
+    "scikit-learn", "pyserial", "opencv-python-headless", "pillow",
+    "lerobot==0.4.4",
+    "torchcodec==0.3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "ipykernel"]
 
 [tool.setuptools]
-py-modules = ["virtual_gripper", "collect_data", "inspect_dataset", "visualize_episode"]
+py-modules = ["virtual_gripper", "collect_data"]
 
 [tool.setuptools.packages.find]
 include = ["lone_data*"]

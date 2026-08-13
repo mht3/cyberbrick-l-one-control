@@ -1,15 +1,21 @@
 """Background-thread webcam capture for the L-ONE data collector.
 
-The capture device is opened on the caller's thread (macOS AVFoundation
-needs a real run loop pumping for the camera-permission prompt, which a
-bare background thread doesn't provide) -- only the continuous `.read()`
-pumping happens on the background thread.
+The capture device is opened on the caller's thread (macOS AVFoundation needs a
+real run loop pumping for the camera-permission prompt, which a bare background
+thread doesn't provide) -- only the continuous `.read()` pumping happens on the
+background thread.
+
+Frames carry a sequence number so the recorder can tell a fresh frame from a
+repeat: if the camera can't sustain the dataset's fps, recording anyway would
+silently write duplicate frames under distinct timestamps.
 """
 
 import threading
 import time
 
 import cv2
+
+_FPS_WINDOW = 60  # frames used for the rolling rate estimate
 
 
 class CameraStream:
@@ -30,17 +36,15 @@ class CameraStream:
         self.actual_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         self._lock = threading.Lock()
-        self._latest = None  # (frame, monotonic_ts)
+        self._latest = None  # (frame, monotonic_ts, seq)
         self._running = False
         self._thread = None
 
-        self._frame_count = 0
-        self._measure_start = None
+        self._seq = 0
+        self._recent = []  # monotonic timestamps of the last _FPS_WINDOW frames
 
     def start(self):
         self._running = True
-        self._measure_start = time.monotonic()
-        self._frame_count = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -52,25 +56,30 @@ class CameraStream:
                 continue
             ts = time.monotonic()
             with self._lock:
-                self._latest = (frame, ts)
-                self._frame_count += 1
+                self._seq += 1
+                self._latest = (frame, ts, self._seq)
+                self._recent.append(ts)
+                if len(self._recent) > _FPS_WINDOW:
+                    del self._recent[: len(self._recent) - _FPS_WINDOW]
 
     def get_latest(self):
-        """Returns (frame, monotonic_ts) for the latest frame, or None if nothing captured yet."""
+        """Returns (frame, monotonic_ts, seq), or None if nothing captured yet."""
         with self._lock:
             return self._latest
 
     @property
     def measured_fps(self):
-        elapsed = time.monotonic() - self._measure_start if self._measure_start else 0
-        if elapsed <= 0:
-            return 0.0
+        """Rolling capture rate over the last _FPS_WINDOW frames."""
         with self._lock:
-            count = self._frame_count
-        return count / elapsed
+            recent = self._recent
+            if len(recent) < 2:
+                return 0.0
+            span = recent[-1] - recent[0]
+            return (len(recent) - 1) / span if span > 0 else 0.0
 
     def stop(self):
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=2)
+            self._thread = None
         self._cap.release()

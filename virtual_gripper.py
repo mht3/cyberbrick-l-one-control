@@ -48,6 +48,23 @@ KEY_JOINTS = {
 GRIPPER_KEY = "space"
 
 WIFI_PORT = 8266
+# Reaching the board takes as long as it takes (DNS, a board still booting into
+# WiFi mode), but once connected a command that hasn't been answered within
+# WIFI_COMMAND_TIMEOUT is never going to be useful for teleop -- and the caller
+# is blocked for exactly that long. Keeping the connect timeout on the socket
+# afterwards is what turned a single lost reply into a 5s command blackout.
+WIFI_CONNECT_TIMEOUT = 5
+WIFI_COMMAND_TIMEOUT = 1.0
+
+
+class LinkDesynced(RuntimeError):
+    """The link's request/response framing can no longer be trusted.
+
+    Raised after a command times out. The command was still sent, so its reply
+    is in flight: reading it as the *next* command's reply would silently shift
+    every subsequent reply by one, and the caller would never know. The link
+    has to be dropped and reconnected instead.
+    """
 
 
 def _load_wifi_secrets():
@@ -233,9 +250,19 @@ class CyberBrickWifiLink:
     that firmware choice is active, not just while a client is connected.
     """
 
-    def __init__(self, host, port=WIFI_PORT, timeout=5):
+    def __init__(self, host, port=WIFI_PORT, timeout=WIFI_CONNECT_TIMEOUT,
+                 command_timeout=WIFI_COMMAND_TIMEOUT):
         self.sock = socket.create_connection((host, port), timeout=timeout)
+        # Nagle would hold each short command waiting to coalesce with a next
+        # one that only gets sent after this one is answered.
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.settimeout(command_timeout)
         self._rx_buf = b""
+        self._desynced = False
+        # send_now() dispatches on the caller's thread while CommandBus's worker
+        # may be mid-_send on this same socket; two threads interleaving writes
+        # and reads is its own way to mispair replies with commands.
+        self._lock = threading.Lock()
 
     def _readline(self):
         while b"\n" not in self._rx_buf:
@@ -247,8 +274,20 @@ class CyberBrickWifiLink:
         return line.decode(errors="replace")
 
     def _send(self, line):
-        self.sock.sendall((line + "\n").encode())
-        reply = self._readline()
+        with self._lock:
+            if self._desynced:
+                raise LinkDesynced("link desynced by an earlier timeout -- reconnect")
+            try:
+                self.sock.sendall((line + "\n").encode())
+                reply = self._readline()
+            except socket.timeout as e:
+                self._desynced = True
+                raise LinkDesynced(f"{line!r} not answered in {self.sock.gettimeout()}s") from e
+            except OSError as e:
+                # Broken pipe, connection reset, closed by the board. socket.timeout
+                # is an OSError subclass too, so it has to be caught above this.
+                self._desynced = True
+                raise LinkDesynced(f"{line!r} failed: {e}") from e
         if reply.startswith("ERR"):
             raise RuntimeError(reply)
         return reply

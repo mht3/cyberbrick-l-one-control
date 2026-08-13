@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Data-collection GUI for the CyberBrick L-ONE arm.
 
-Teleoperates the robot exactly like virtual_gripper.py (same link classes,
-same joint keybindings) while recording synchronized (image, action,
-timestamp) demonstrations into a model-agnostic Zarr replay buffer, plus a
-raw MP4 backup per episode. See lone_data/replay_buffer.py for the schema
-and lone_data/metadata.py for the synchronization-strategy writeup.
+Teleoperates the robot exactly like virtual_gripper.py (same link classes, same
+joint keybindings) while recording demonstrations straight into a standard
+LeRobotDataset. See lone_data/features.py for the schema.
+
+Robot commands go through a CommandBus worker thread rather than being sent
+from the Tk main thread, so a slow board can't stall frame capture -- that is
+what held the previous recorder to ~14.8 Hz.
 """
 
 import argparse
 import datetime
+import json
 import os
 import queue
 import signal
@@ -42,24 +45,38 @@ from virtual_gripper import (
     CyberBrickLink,
     CyberBrickWifiLink,
     JointControl,
+    LinkDesynced,
     find_default_port,
     list_usb_ports,
     pick_default_port,
 )
 
-from lone_data import curation
 from lone_data.camera import CameraStream
-from lone_data.metadata import DatasetMetadata
-from lone_data.replay_buffer import ACTION_DIM, ACTION_NAMES, LoneReplayBuffer
-from lone_data.validation import validate_episode
+from lone_data.command_bus import CommandBus
+from lone_data.features import (
+    ACTION_DIM,
+    ACTION_NAMES,
+    CAMERA_KEY,
+    DEFAULT_IMAGE_SIZE,
+    resize_keep_aspect,
+)
+from lone_data.lerobot_recorder import LoneRecorder, has_saved_episodes
+from lone_data.playback import EpisodeVideo
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Comfortably under wifi_bridge.py's 500ms COMMAND_DEADMAN_TIMEOUT (a single global timer, not per-joint).
+# Comfortably under wifi_bridge.py's COMMAND_DEADMAN_TIMEOUT (a single global timer, not per-joint).
 WIFI_HEARTBEAT_MS = 200
 
+# Auto-reconnect budget. A link that survives HEALTHY_LINK_SECONDS counts as
+# having genuinely worked, so losing it later starts the budget over; links that
+# die sooner are failing for a persistent reason and burn through it instead.
+HEALTHY_LINK_SECONDS = 10.0
+MAX_AUTO_RECONNECTS = 3
+
 DISPLAY_MAX_WIDTH = 640
-FEED_REFRESH_MS = 33  # ~30Hz on-screen preview, independent of record rate
+FEED_REFRESH_MS = 50  # ~20Hz preview; deliberately below the record rate so the
+                      # preview never competes with the record tick for the main thread
 
 
 def list_cameras(max_index=6):
@@ -75,16 +92,49 @@ def list_cameras(max_index=6):
         cap.release()
 
 
+def _serial_error_hint(port, exc, ports=()):
+    """The raw-REPL handshake failing with an empty buffer means nothing came
+    back at all. The underlying TimeoutError text is accurate but unreadable,
+    and it doesn't say which of several quite different causes applies."""
+    if isinstance(exc, TimeoutError) and "got b''" in str(exc):
+        seen = ", ".join(ports) if ports else "none"
+        return (
+            f"{port} opened but didn't answer the raw-REPL handshake within 3s.\n"
+            f"  ports seen: {seen}\n"
+            "  - A board already in WiFi mode may not answer over USB -- use WiFi instead.\n"
+            "  - Otherwise power-cycle the board with the cable attached, then retry.\n"
+            "  - If several ports are listed, the board may be a different one."
+        )
+    return f"connection to {port} failed: {exc}"
+
+
+def _wifi_error_hint(host, exc):
+    """wifi_bridge.py tries STA first and only starts the AP if STA fails, so an
+    unreachable STA hostname usually means it fell back to the AP."""
+    return (
+        f"couldn't reach {host}:{WIFI_PORT} ({exc}).\n"
+        f"  - The board only enters WiFi mode ~15s after boot with no remote paired, then reboots "
+        f"-- allow ~25s total.\n"
+        f"  - wifi_bridge.py joins the STA network from wifi_secrets.py first and starts its own AP "
+        f"only if that fails. An unreachable hostname usually means STA didn't work and it is on "
+        f"the AP: tick 'AP Mode', join '{AP_SSID}' in macOS WiFi settings, then Connect."
+    )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--camera-index", type=int, default=0, help="cv2.VideoCapture index (see --list-cameras)")
     p.add_argument("--list-cameras", action="store_true", help="probe camera indices and exit")
     p.add_argument("--width", type=int, default=1280, help="requested camera capture width")
     p.add_argument("--height", type=int, default=720, help="requested camera capture height")
-    p.add_argument("--fps", type=int, default=30, help="requested camera capture fps")
-    p.add_argument("--record-hz", type=float, default=30.0, help="target dataset sampling rate")
-    p.add_argument("--output", default="datasets/lone_dataset.zarr", help="path to the Zarr dataset")
-    p.add_argument("--raw-dir", default="raw", help="directory for per-episode MP4 backups")
+    p.add_argument("--camera-fps", type=int, default=30, help="requested camera capture fps")
+    p.add_argument("--fps", type=int, default=25, help="dataset recording rate")
+    p.add_argument("--repo-id", default="lone/l_one", help="LeRobot dataset repo id")
+    p.add_argument("--root", default=None, help="dataset directory (default: data/lerobot/<repo-id>)")
+    p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1],
+                   help="frame width stored in the dataset (must match the camera's aspect ratio)")
+    p.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_SIZE[0],
+                   help="frame height stored in the dataset (must match the camera's aspect ratio)")
     p.add_argument("--task", default="", help="default task/instruction string")
     return p.parse_args()
 
@@ -106,47 +156,64 @@ class CollectDataApp(tk.Tk):
         self._pressed_keys = set()
         self._key_release_after = {}
         self._wifi_connect_generation = 0
+        self._shutting_down = False
+        self._link_up_mono = None      # when the current link connected
+        self._failed_reconnects = 0    # consecutive auto-reconnects that died young
+
+        # Robot I/O runs here, off the Tk main thread (see module docstring).
+        # Both callbacks fire on the bus worker thread, so they hop back to the
+        # main thread via after() before touching any widget.
+        self.bus = CommandBus(
+            on_error=lambda m: self.after(0, self._log, f"Command failed: {m}", "error"),
+            on_link_dead=lambda m: self.after(0, self._on_link_dead, m),
+            fatal_errors=(LinkDesynced,),
+        )
+        self.bus.start()
 
         # -- camera -------------------------------------------------------
         # Opened on the main thread so macOS's camera-permission prompt gets a run loop.
-        self.camera = CameraStream(args.camera_index, args.width, args.height, args.fps)
+        self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
         self.camera.start()
 
         # -- dataset --------------------------------------------------------
-        self.output_path = os.path.abspath(args.output)
-        os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
-        self.raw_dir = args.raw_dir
-        if not os.path.isabs(self.raw_dir):
-            self.raw_dir = os.path.join(os.path.dirname(self.output_path), self.raw_dir)
-        os.makedirs(self.raw_dir, exist_ok=True)
+        # Not created here. LeRobot writes meta/info.json the moment a dataset
+        # exists, so creating one up front leaves an empty dataset behind every
+        # time the app is opened and closed without recording. Deferred to the
+        # first episode -- see _ensure_recorder().
+        self.image_size = (args.image_height, args.image_width)
+        self._check_storage_aspect()
+        root = args.root or os.path.join(REPO_DIR, "data", "lerobot", *args.repo_id.split("/"))
+        self.dataset_root = os.path.abspath(root)
+        self.recorder = None
 
-        self.replay_buffer = LoneReplayBuffer(self.output_path)
-        self.metadata = DatasetMetadata(self.output_path, repo_dir=REPO_DIR)
-        self.metadata.set_default_task(args.task)
-        self.metadata.save()
-        self._scan_orphaned_videos()
+        self.log_dir = os.path.join(REPO_DIR, "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.session_log_path = os.path.join(
+            self.log_dir, f"collection_{datetime.datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        )
 
         # -- recording state ------------------------------------------------
         self._current_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self._recording = False
-        self._video_writer = None
-        self._video_path = None
-        self._episode_index = self.replay_buffer.n_episodes
+        self._period = 1.0 / args.fps
+        self._next_deadline = None
         self._episode_step_count = 0
+        self._episode_missed = 0
+        self._episode_repeats = 0
         self._episode_start_mono = None
         self._episode_start_wall = None
         self._episode_task = ""
-        self._record_interval_ms = max(1, int(1000 / args.record_hz))
+        self._last_frame_seq = None
+        self._feed_ticks = 0
 
-        # -- review/curation state --------------------------------------
+        # -- review state --------------------------------------------------
         self._review_mode = False
         self._review_playing = False
         self._review_episode_idx = None
-        self._review_imgs = None
-        self._review_actions = None
-        self._review_timestamps = None
+        self._review_video = None
+        self._review_len = 0
         self._review_frame_idx = 0
-        self._review_frame_interval_ms = self._record_interval_ms
+        self._review_frame_interval_ms = max(1, int(1000 * self._period))
         self._review_slider_syncing = False
 
         # -- UI ---------------------------------------------------------
@@ -206,6 +273,8 @@ class CollectDataApp(tk.Tk):
         self._update_status_label()
         self.focus_set()
 
+        self._log(f"Dataset will be written to {self.dataset_root} @ {args.fps} fps", level="info")
+
         self.after(0, self._update_camera_feed)
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
 
@@ -215,22 +284,55 @@ class CollectDataApp(tk.Tk):
         # Lets Ctrl+C get delivered promptly -- mainloop() doesn't check for signals on its own.
         self.after(200, self._signal_pump)
 
-    def _scan_orphaned_videos(self):
-        n_episodes = self.replay_buffer.n_episodes
-        if not os.path.isdir(self.raw_dir):
+    def _check_storage_aspect(self):
+        """Frames are downscaled, never cropped or padded, so a stored size
+        whose aspect ratio doesn't match the camera's silently stretches every
+        frame in the dataset. Refuse up front instead."""
+        store_h, store_w = self.image_size
+        cam_w, cam_h = self.camera.actual_width, self.camera.actual_height
+        if not cam_w or not cam_h:
             return
-        for fname in sorted(os.listdir(self.raw_dir)):
-            if not (fname.startswith("episode_") and fname.endswith(".mp4")):
-                continue
-            try:
-                idx = int(fname[len("episode_"):-len(".mp4")])
-            except ValueError:
-                continue
-            if idx >= n_episodes:
-                print(
-                    f"[warn] Orphaned video raw/{fname} has no matching dataset episode "
-                    f"(dataset has {n_episodes} episodes) -- likely from a crashed session, left as-is"
-                )
+        if abs((store_w / store_h) - (cam_w / cam_h)) > 0.01:
+            raise SystemExit(
+                f"--image-width/--image-height {store_w}x{store_h} "
+                f"({store_w / store_h:.3f}:1) does not match the camera's "
+                f"{cam_w}x{cam_h} ({cam_w / cam_h:.3f}:1).\n"
+                "Frames are scaled, not cropped or padded, so this would distort every frame. "
+                f"Use a size with the camera's aspect ratio (e.g. {cam_w // 2}x{cam_h // 2})."
+            )
+
+    # -- dataset (created lazily, on the first episode) ------------------
+
+    @property
+    def _n_episodes(self):
+        return self.recorder.num_episodes if self.recorder is not None else 0
+
+    @property
+    def _n_frames(self):
+        return self.recorder.num_frames if self.recorder is not None else 0
+
+    def _ensure_recorder(self):
+        """Opens (or creates) the dataset on first use. Returns False and logs
+        if it can't, so a dataset problem never leaves a half-started episode."""
+        if self.recorder is not None:
+            return True
+        try:
+            os.makedirs(os.path.dirname(self.dataset_root), exist_ok=True)
+            self.recorder = LoneRecorder(
+                self.args.repo_id, self.dataset_root, fps=self.args.fps, image_size=self.image_size
+            )
+        except Exception as e:
+            self._log(f"Could not open dataset: {e}", level="error")
+            return False
+        if self.recorder.resumed:
+            self._log(
+                f"Appending to existing dataset ({self.recorder.num_episodes} episode(s), "
+                f"{self.recorder.num_frames} frames) at {self.dataset_root}",
+                level="info",
+            )
+        else:
+            self._log(f"Created dataset at {self.dataset_root} @ {self.args.fps} fps", level="connected")
+        return True
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -365,21 +467,90 @@ class CollectDataApp(tk.Tk):
 
     def _drop_link(self, reset_board=True):
         if self.link is not None:
-            if isinstance(self.link, CyberBrickWifiLink):
-                self.link.close(reset_board=reset_board)
-            else:
-                self.link.close()
+            link = self.link
             self.link = None
+            self.bus.set_link(None)
+            # close() talks to the board (RESET or STOP), which is a full round
+            # trip on a link that may already be dead. Doing that inline froze
+            # the Tk main thread for the socket timeout every time a connection
+            # was dropped -- including the drop at the start of every reconnect.
+            threading.Thread(
+                target=self._close_link_quietly, args=(link, reset_board), daemon=True
+            ).start()
         self.wifi_kind = None
         self.ap_ip = None
+        self._link_up_mono = None
         self._set_episode_buttons_state()
 
-    def _fall_back_to_idle(self):
-        self._drop_link()
-        self.mode_var.set("")
+    def _close_link_quietly(self, link, reset_board):
+        try:
+            if isinstance(link, CyberBrickWifiLink):
+                link.close(reset_board=reset_board)
+            else:
+                link.close()
+        except Exception as e:
+            self.after(0, self._log, f"Link close failed: {e}", "warn")
+
+    def _on_link_dead(self, message):
+        """The link stopped answering. Until this existed the link stayed
+        'connected' forever while every command failed, so the only way out was
+        to notice the red log lines and reconnect by hand.
+
+        Reconnecting is only worth doing for a link that was actually working:
+        a connection that dies on its first command is failing for a reason
+        retrying won't fix, and retrying it in a tight loop just buries the real
+        error under reconnect spam."""
+        if self._shutting_down or self.link is None:
+            return
+        self._log(f"Link lost: {message}", level="error")
+        was_wifi = isinstance(self.link, CyberBrickWifiLink)
+        host = self.host_var.get().strip() if was_wifi else None
+        # Read before _drop_link() clears it.
+        link_up_mono = self._link_up_mono
+        if self._recording:
+            self._log("Link lost while recording -- discarding in-progress episode", level="warn")
+            self._discard_episode()
+        # reset_board=False: the board is already unreachable, and a RESET would
+        # drop it out of WiFi mode entirely just as we try to reconnect.
+        self._drop_link(reset_board=False)
         self._update_transport_controls_visibility()
         self._update_sta_button_visibility()
-        self._log("Disconnected (power-cycle board for RC mode)", level="info")
+
+        if not (was_wifi and host):
+            self._log("Reconnect from the controls above.", level="info")
+            return
+
+        uptime = time.monotonic() - (link_up_mono or 0)
+        if link_up_mono is None or uptime < HEALTHY_LINK_SECONDS:
+            self._failed_reconnects += 1
+        else:
+            self._failed_reconnects = 1  # a real session ended; this one is fresh
+        if self._failed_reconnects > MAX_AUTO_RECONNECTS:
+            self._log(
+                f"Gave up after {MAX_AUTO_RECONNECTS} reconnects that each died within "
+                f"{HEALTHY_LINK_SECONDS:.0f}s. The board is reachable but drops the connection, "
+                "so this is the firmware or the network, not a blip -- check the board's serial "
+                "output, or tick 'AP Mode' to bypass the campus network. Connect to retry.",
+                level="error",
+            )
+            self._failed_reconnects = 0
+            return
+        delay = min(0.5 * 2 ** (self._failed_reconnects - 1), 5.0)
+        self._log(
+            f"Reconnecting to {host} in {delay:.1f}s "
+            f"({self._failed_reconnects}/{MAX_AUTO_RECONNECTS})...",
+            level="connecting",
+        )
+        self.after(int(delay * 1000), self._connect_wifi, host, True)
+
+    def _fall_back_to_idle(self):
+        """Drops the link but keeps the selected transport's controls on screen.
+        Clearing mode_var here would hide the port dropdown and host field --
+        exactly the controls needed to recover from a failed connection."""
+        self._drop_link()
+        self._update_transport_controls_visibility()
+        self._update_sta_button_visibility()
+        self._log("Disconnected -- adjust the port/host above and reconnect.", level="info")
 
     def _on_mode_select(self):
         mode = self.mode_var.get()
@@ -405,10 +576,12 @@ class CollectDataApp(tk.Tk):
         self.update_idletasks()
         try:
             self.link = CyberBrickLink(port)
+            self.bus.set_link(self.link)
+            self._link_up_mono = time.monotonic()
             self._log(f"Connected via Serial ({port}, remote inactive)", level="connected")
             self._sync_gripper_state()
         except Exception as e:
-            self._log(f"Serial connection failed: {e}", level="error")
+            self._log(f"Serial: {_serial_error_hint(port, e, list_usb_ports())}", level="error")
             self._fall_back_to_idle()
         finally:
             self._set_busy(False)
@@ -421,6 +594,8 @@ class CollectDataApp(tk.Tk):
                 self._log("Enter the board's IP address or hostname.", level="warn")
             self._fall_back_to_idle()
             return
+        if not silent:
+            self._failed_reconnects = 0  # explicit user action -- fresh budget
         self._drop_link(reset_board=False)
         self._wifi_connect_generation += 1
         generation = self._wifi_connect_generation
@@ -460,14 +635,12 @@ class CollectDataApp(tk.Tk):
                 self._update_sta_button_visibility()
             else:
                 self._fall_back_to_idle()
-                self._log(
-                    f"Couldn't reach {host}:{WIFI_PORT} -- check the board is powered, "
-                    f"already in WiFi mode, and reachable ({payload})",
-                    level="error",
-                )
+                self._log(f"WiFi: {_wifi_error_hint(host, payload)}", level="error")
             return
 
         self.link = payload
+        self.bus.set_link(self.link)
+        self._link_up_mono = time.monotonic()
         self.wifi_kind = "ap" if host == AP_FIXED_IP else "sta"
         self.ap_ip = host if self.wifi_kind == "ap" else None
         label = f"AP {host}" if self.wifi_kind == "ap" else f"STA at {host}"
@@ -616,6 +789,10 @@ class CollectDataApp(tk.Tk):
         ttk.Label(frame, textvariable=self.status_var, style="KeyHint.TLabel").grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
+        self.rate_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.rate_var, style="KeyHint.TLabel").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(2, 0)
+        )
         return frame
 
     def _setup_episode_keybindings(self):
@@ -626,11 +803,10 @@ class CollectDataApp(tk.Tk):
                 handler()
             return wrapped
 
-        # BackSpace is dual-purpose: Discard while recording, Delete while reviewing.
         self.bind("<Return>", guarded(self._start_episode))
         self.bind("<KeyPress-f>", guarded(self._finish_episode))
         self.bind("<KeyPress-F>", guarded(self._finish_episode))
-        self.bind("<BackSpace>", guarded(self._handle_backspace_key))
+        self.bind("<BackSpace>", guarded(self._discard_episode))
         self.bind("<KeyPress-q>", guarded(self._quit))
         self.bind("<KeyPress-Q>", guarded(self._quit))
         self.bind("<KeyPress-r>", guarded(self._enter_review_mode))
@@ -645,12 +821,6 @@ class CollectDataApp(tk.Tk):
         self.bind("<KeyPress-Right>", guarded(self._next_review_episode), add="+")
         self.bind("<Escape>", guarded(self._exit_review_mode))
 
-    def _handle_backspace_key(self):
-        if self._review_mode:
-            self._delete_review_episode()
-        else:
-            self._discard_episode()
-
     def _set_episode_buttons_state(self):
         connected = self.link is not None
         can_start = connected and not self._recording and not self._review_mode
@@ -658,21 +828,47 @@ class CollectDataApp(tk.Tk):
         self.finish_btn.config(state="normal" if self._recording else "disabled")
         self.discard_btn.config(state="normal" if self._recording else "disabled")
 
+    def _link_readout(self):
+        """Command latency, so a degrading link is visible before an episode is
+        recorded over it rather than only in logs/collection_*.jsonl afterwards."""
+        if self.link is None:
+            return "link none"
+        s = self.bus.stats()
+        if not s["sent"]:
+            return "link idle"
+        text = f"link {s['latency_mean'] * 1000:.0f}/{s['latency_max'] * 1000:.0f} ms avg/max"
+        if s["dropped"]:
+            text += f"  ·  {s['dropped']} stale cmds"
+        return text
+
     def _update_status_label(self):
         if self._recording:
             elapsed = time.monotonic() - self._episode_start_mono
             self.status_var.set(
-                f"Recording episode {self._episode_index:06d} -- "
+                f"Recording episode {self._n_episodes:06d} -- "
                 f"{self._episode_step_count} steps, {elapsed:0.1f}s"
             )
+            achieved = self._episode_step_count / elapsed if elapsed > 0 else 0.0
+            self.rate_var.set(
+                f"{achieved:.1f}/{self.args.fps} fps  ·  camera {self.camera.measured_fps:.1f} fps  ·  "
+                f"missed {self._episode_missed}  ·  stale frames {self._episode_repeats}  ·  "
+                f"{self._link_readout()}"
+            )
         else:
-            self.status_var.set(f"Idle -- {self.replay_buffer.n_episodes} episode(s) recorded")
+            self.status_var.set(
+                f"Idle -- {self._n_episodes} episode(s), {self._n_frames} frames"
+            )
+            self.rate_var.set(
+                f"camera {self.camera.measured_fps:.1f} fps  ·  {self._link_readout()}"
+            )
 
-    # -- review/curation mode: play back recorded episodes, prune bad ones --
-    # (see lone_data/curation.py for Delete's Zarr/metadata/MP4 re-indexing)
+    # -- review mode: play back recorded episodes ------------------------
+    # lerobot closes the parquet writer and reopens for reading on first
+    # __getitem__, then starts a new file on the next save_episode, so reading
+    # back mid-session is supported.
 
     def _build_review_controls(self, parent):
-        # review_active_frame (nav + task editing) only shows while reviewing -- _apply_mode_visibility.
+        # review_active_frame only shows while reviewing -- _apply_mode_visibility.
         self.review_section_frame = ttk.Frame(parent, padding=(0, 0, 0, 12))
         self.review_section_frame.pack(fill="x")
         frame = self.review_section_frame
@@ -697,23 +893,15 @@ class CollectDataApp(tk.Tk):
         nav_row.pack(fill="x")
         self.review_prev_btn = ttk.Button(nav_row, text="◀ Previous (←)", command=self._previous_review_episode)
         self.review_next_btn = ttk.Button(nav_row, text="Next ▶ (N / →)", command=self._next_review_episode)
-        self.review_delete_btn = ttk.Button(
-            nav_row, text="Delete (⌫)", style="Danger.TButton", command=self._delete_review_episode
-        )
         self.review_exit_btn = ttk.Button(nav_row, text="Exit (Esc)", command=self._exit_review_mode)
         self.review_prev_btn.pack(side="left")
         self.review_next_btn.pack(side="left", padx=(6, 0))
-        self.review_delete_btn.pack(side="left", padx=(6, 0))
         self.review_exit_btn.pack(side="left", padx=(6, 0))
 
-        task_row = ttk.Frame(self.review_active_frame)
-        task_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(task_row, text="Task").pack(side="left")
         self.review_task_var = tk.StringVar(value="")
-        self.review_task_entry = ttk.Entry(task_row, textvariable=self.review_task_var, width=24)
-        self.review_task_entry.pack(side="left", padx=(6, 0))
-        self.review_task_save_btn = ttk.Button(task_row, text="Update Task", command=self._update_review_task)
-        self.review_task_save_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(self.review_active_frame, textvariable=self.review_task_var, style="KeyHint.TLabel").pack(
+            fill="x", pady=(6, 0)
+        )
 
         self._set_review_buttons_state()
 
@@ -722,18 +910,15 @@ class CollectDataApp(tk.Tk):
         state = "normal" if self._review_mode else "disabled"
         self.review_prev_btn.config(state=state)
         self.review_next_btn.config(state=state)
-        self.review_delete_btn.config(state=state)
         self.review_exit_btn.config(state=state)
-        self.review_task_entry.config(state=state)
-        self.review_task_save_btn.config(state=state)
         self.review_play_btn.config(state=state)
         self.review_slider.config(state=state)
 
     def _update_review_status_label(self):
         if self._review_mode and self._review_episode_idx is not None:
-            n = self.replay_buffer.n_episodes
+            n = self._n_episodes
             self.review_status_var.set(
-                f"Episode {self._review_episode_idx:06d} / {n - 1:06d}  ({len(self._review_imgs)} steps)"
+                f"Episode {self._review_episode_idx:06d} / {n - 1:06d}  ({self._review_len} steps)"
             )
         else:
             self.review_status_var.set("Not reviewing")
@@ -744,7 +929,21 @@ class CollectDataApp(tk.Tk):
             return
         if self._review_mode:
             return
-        if self.replay_buffer.n_episodes == 0:
+        # The recorder is created lazily on the first episode, so on a fresh
+        # launch it is None and _n_episodes reads 0 -- which used to report "no
+        # episodes" over a dataset directory full of them. Open it here, but
+        # only once there is something to open: LoneRecorder deletes a dataset
+        # directory that holds metadata and no episodes, which must not be what
+        # entering review does.
+        if self.recorder is None:
+            if not has_saved_episodes(self.dataset_root):
+                self._log("No episodes recorded yet.", level="warn")
+                return
+            self._log(f"Opening {self.dataset_root} for review...", level="info")
+            self.update_idletasks()
+            if not self._ensure_recorder():
+                return
+        if self._n_episodes == 0:
             self._log("No episodes recorded yet.", level="warn")
             return
         self._review_mode = True
@@ -759,10 +958,9 @@ class CollectDataApp(tk.Tk):
             return
         self._review_mode = False
         self._set_review_playing(False)
-        self._review_imgs = None
-        self._review_actions = None
-        self._review_timestamps = None
         self._review_episode_idx = None
+        self._review_video = None
+        self._review_len = 0
         self.review_task_var.set("")
         self.review_slider.config(to=0)
         self.review_slider_var.set(0)
@@ -791,30 +989,39 @@ class CollectDataApp(tk.Tk):
             self.episode_controls_frame.pack(fill="x", before=self.review_section_frame)
 
     def _load_review_episode(self, episode_idx):
-        n = self.replay_buffer.n_episodes
+        n = self._n_episodes
         if n == 0:
             self._exit_review_mode()
             return
         episode_idx = max(0, min(episode_idx, n - 1))
-        start, end = self.replay_buffer.episode_bounds(episode_idx)
+        self._close_review_video()
+        try:
+            ep = self.recorder.episodes[episode_idx]
+            self._review_video = EpisodeVideo(
+                ep["video_path"], ep["from_timestamp"], ep["length"], self.args.fps
+            )
+        except Exception as e:
+            self._log(f"Could not open episode {episode_idx} video: {e}", level="error")
+            self._exit_review_mode()
+            return
         self._review_episode_idx = episode_idx
-        self._review_imgs = self.replay_buffer.img[start:end]
-        self._review_actions = self.replay_buffer.action[start:end]
-        self._review_timestamps = self.replay_buffer.timestamp[start:end]
+        self._review_len = ep["length"]
         self._review_frame_idx = 0
-        # Constant interval at the episode's average fps -- using each frame's exact
-        # recorded gap instead reproduces capture jitter as visible stutter.
-        ts = self._review_timestamps
-        if len(ts) > 1:
-            self._review_frame_interval_ms = max(1, int(1000 * (ts[-1] - ts[0]) / (len(ts) - 1)))
-        else:
-            self._review_frame_interval_ms = self._record_interval_ms
-        self.review_task_var.set(self.metadata.episode_task(episode_idx))
-        self.review_slider.config(to=max(0, len(self._review_imgs) - 1))
+        self.review_task_var.set(f"Task: {ep['task'] or '(recorded in an earlier session)'}")
+        self._review_frame_interval_ms = max(1, int(1000 * self._period))
+        self.review_slider.config(to=max(0, self._review_len - 1))
         self._update_review_status_label()
-        self._log(f"Reviewing episode {episode_idx:06d}/{n - 1:06d} ({end - start} steps)", level="info")
+        self._log(f"Reviewing episode {episode_idx:06d}/{n - 1:06d} ({self._review_len} steps)", level="info")
         self._set_review_playing(True)
         self._render_review_frame()
+
+    def _close_review_video(self):
+        if self._review_video is not None:
+            try:
+                self._review_video.close()
+            except Exception:
+                pass
+            self._review_video = None
 
     def _set_review_playing(self, playing):
         self._review_playing = playing
@@ -825,29 +1032,35 @@ class CollectDataApp(tk.Tk):
             return
         # Replaying from the start after it ran off the end reads better
         # than "playing" a paused freeze-frame at the last position.
-        if not self._review_playing and self._review_imgs is not None and self._review_frame_idx >= len(self._review_imgs) - 1:
+        if not self._review_playing and self._review_frame_idx >= self._review_len - 1:
             self._review_frame_idx = 0
         self._set_review_playing(not self._review_playing)
 
     def _render_review_frame(self):
-        imgs = self._review_imgs
-        if imgs is None or len(imgs) == 0:
+        if self._review_len == 0 or self._review_video is None:
             return
-        idx = self._review_frame_idx
-        action = self._review_actions[idx]
-        display = imgs[idx].copy()  # already RGB -- no BGR round trip needed just to draw text
-        lines = [f"REVIEW episode {self._review_episode_idx:06d}"] + [
-            f"{name}: {action[i]:.1f}" for i, name in enumerate(ACTION_NAMES)
-        ]
+        try:
+            display = self._review_video.frame(self._review_frame_idx).copy()
+        except Exception as e:
+            self._log(f"Review read failed: {e}", level="error")
+            self._set_review_playing(False)
+            return
+
+        lines = [f"REVIEW episode {self._review_episode_idx:06d}"]
+        actions = self.recorder.episode_actions.get(self._review_episode_idx)
+        if actions is not None and self._review_frame_idx < len(actions):
+            action = actions[self._review_frame_idx]
+            lines += [f"{name}: {action[i]:.1f}" for i, name in enumerate(ACTION_NAMES)]
         for i, line in enumerate(lines):
-            cv2.putText(display, line, (10, 24 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 1, cv2.LINE_AA)
+            cv2.putText(display, line, (6, 16 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 0), 1, cv2.LINE_AA)
+
         h, w = display.shape[:2]
-        if w > DISPLAY_MAX_WIDTH:
-            scale = DISPLAY_MAX_WIDTH / w
-            display = cv2.resize(display, (DISPLAY_MAX_WIDTH, int(h * scale)))
+        scale = DISPLAY_MAX_WIDTH / w
+        display = cv2.resize(display, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_NEAREST)
         photo = ImageTk.PhotoImage(Image.fromarray(display))
         self.camera_label.configure(image=photo)
         self.camera_label.image = photo
+
         self._sync_review_slider()
         self._update_review_time_label()
 
@@ -860,18 +1073,14 @@ class CollectDataApp(tk.Tk):
             self._review_slider_syncing = False
 
     def _update_review_time_label(self):
-        ts = self._review_timestamps
-        if ts is None or len(ts) == 0:
-            self.review_time_var.set("0.0s / 0.0s")
-            return
-        cur = ts[self._review_frame_idx] - ts[0]
-        total = ts[-1] - ts[0]
+        cur = self._review_frame_idx * self._period
+        total = max(0, self._review_len - 1) * self._period
         self.review_time_var.set(f"{cur:.1f}s / {total:.1f}s")
 
     def _on_review_slider_drag(self, value):
-        if self._review_slider_syncing or not self._review_mode or self._review_imgs is None:
+        if self._review_slider_syncing or not self._review_mode or self._review_len == 0:
             return
-        idx = max(0, min(int(round(float(value))), len(self._review_imgs) - 1))
+        idx = max(0, min(int(round(float(value))), self._review_len - 1))
         if idx == self._review_frame_idx:
             return
         self._review_frame_idx = idx
@@ -881,28 +1090,24 @@ class CollectDataApp(tk.Tk):
         if not self._review_mode:
             return
         try:
-            if not self._review_playing:
-                self.after(self._record_interval_ms, self._review_tick)
-                return
-            imgs = self._review_imgs
-            if imgs is None or len(imgs) == 0:
-                self.after(self._record_interval_ms, self._review_tick)
+            if not self._review_playing or self._review_len == 0:
+                self.after(self._review_frame_interval_ms, self._review_tick)
                 return
             self._render_review_frame()
-            if self._review_frame_idx >= len(imgs) - 1:
+            if self._review_frame_idx >= self._review_len - 1:
                 self._set_review_playing(False)  # reached the end -- pause on the last frame, don't loop
+                self.after(self._review_frame_interval_ms, self._review_tick)
                 return
             self._review_frame_idx += 1
             self.after(self._review_frame_interval_ms, self._review_tick)
         except Exception as e:
             self._log(f"Review playback tick failed: {e}", level="error")
-            self.after(self._record_interval_ms, self._review_tick)
+            self.after(self._review_frame_interval_ms, self._review_tick)
 
     def _next_review_episode(self):
         if not self._review_mode or self._review_episode_idx is None:
             return
-        n = self.replay_buffer.n_episodes
-        if self._review_episode_idx + 1 >= n:
+        if self._review_episode_idx + 1 >= self._n_episodes:
             self._log("Reached the last episode.", level="info")
             return
         self._load_review_episode(self._review_episode_idx + 1)
@@ -914,32 +1119,6 @@ class CollectDataApp(tk.Tk):
             self._log("Already at the first episode.", level="info")
             return
         self._load_review_episode(self._review_episode_idx - 1)
-
-    def _update_review_task(self):
-        if not self._review_mode or self._review_episode_idx is None:
-            return
-        new_task = self.review_task_var.get().strip()
-        self.metadata.set_episode_task(self._review_episode_idx, new_task)
-        self.metadata.save()
-        self._log(f"Updated task for episode {self._review_episode_idx:06d}: {new_task!r}", level="info")
-
-    def _delete_review_episode(self):
-        if not self._review_mode or self._review_episode_idx is None:
-            return
-        idx = self._review_episode_idx
-        removed = curation.delete_episode(self.replay_buffer, self.metadata, self.raw_dir, idx)
-        self._episode_index = self.replay_buffer.n_episodes  # keep next-recording index in sync
-        self._log(
-            f"Deleted episode {idx:06d} ({removed} steps) -- {self.replay_buffer.n_episodes} episode(s) remain",
-            level="warn",
-        )
-        n = self.replay_buffer.n_episodes
-        if n == 0:
-            self._exit_review_mode()
-            return
-        # Everything at and after idx shifted down by one, so re-loading
-        # the same index now shows what used to be the next episode.
-        self._load_review_episode(min(idx, n - 1))
 
     # -- log panel --------------------------------------------------------
 
@@ -1004,22 +1183,25 @@ class CollectDataApp(tk.Tk):
         self.after(FEED_REFRESH_MS, self._update_camera_feed)
         if self._review_mode:
             return  # _review_tick owns camera_label while reviewing
+        # The idle readout is otherwise only written at startup, when the camera
+        # hasn't produced a frame yet and its rate still reads 0.
+        self._feed_ticks += 1
+        if not self._recording and self._feed_ticks % max(1, 1000 // FEED_REFRESH_MS) == 0:
+            self._update_status_label()
         latest = self.camera.get_latest()
         if latest is None:
             return
-        frame, _ = latest
-        # Overlay is drawn on a COPY -- the frame handed to add_step()/the
-        # video writer elsewhere is never touched by this.
-        display = frame.copy()
+        frame, _ts, _seq = latest
+        # Downscale first, then annotate -- drawing on the full-res frame costs a
+        # 2.7MB copy per refresh on the same thread the record tick runs on.
+        h, w = frame.shape[:2]
+        scale = DISPLAY_MAX_WIDTH / w
+        display = cv2.resize(frame, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_NEAREST)
         if self._recording:
-            label, color = f"REC ep{self._episode_index:06d}  step {self._episode_step_count}", (0, 0, 255)
+            label, color = f"REC ep{self._n_episodes:06d}  step {self._episode_step_count}", (0, 0, 255)
         else:
             label, color = "idle", (200, 200, 200)
         cv2.putText(display, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-        h, w = display.shape[:2]
-        if w > DISPLAY_MAX_WIDTH:
-            scale = DISPLAY_MAX_WIDTH / w
-            display = cv2.resize(display, (DISPLAY_MAX_WIDTH, int(h * scale)))
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.camera_label.configure(image=photo)
@@ -1038,32 +1220,27 @@ class CollectDataApp(tk.Tk):
     def _motor(self, idx, speed):
         if not self._require_link():
             return
-        try:
-            if speed == 0:
-                self.link.stop_motor(idx)
-            else:
-                self.link.set_motor_speed(idx, speed)
-            self._current_action[0] = float(speed)
-        except Exception as e:
-            self._log(f"Command failed: {e}", level="error")
+        # Value 0 is dispatched as stop(), not set_speed(idx, 0) -- different
+        # hardware states. See ZERO_DISPATCH_CONVENTION in lone_data/features.py.
+        # Stops are not droppable: nothing re-sends them, so discarding one
+        # leaves the joint driving until the board's deadman timer fires.
+        if speed == 0:
+            self.bus.submit(f"motor:{idx}", "stop_motor", idx)
+        else:
+            self.bus.submit(f"motor:{idx}", "set_motor_speed", idx, speed, droppable=True)
+        self._current_action[0] = float(speed)
 
     def _servo_speed(self, idx, speed, action_index):
         if not self._require_link():
             return
-        try:
-            if speed == 0:
-                self.link.stop_servo(idx)
-            else:
-                self.link.set_servo_speed(idx, speed)
-            self._current_action[action_index] = float(speed)
-        except Exception as e:
-            self._log(f"Command failed: {e}", level="error")
+        if speed == 0:
+            self.bus.submit(f"servo:{idx}", "stop_servo", idx)
+        else:
+            self.bus.submit(f"servo:{idx}", "set_servo_speed", idx, speed, droppable=True)
+        self._current_action[action_index] = float(speed)
 
     def _sync_gripper_state(self):
-        try:
-            self.link.set_servo_angle(GRIPPER_SERVO, GRIPPER_OPEN_ANGLE)
-        except Exception:
-            return
+        self.bus.submit(f"servo_angle:{GRIPPER_SERVO}", "set_servo_angle", GRIPPER_SERVO, GRIPPER_OPEN_ANGLE)
         self.gripper_open = True
         self.gripper_btn.config(text="Close Clamp")
         self._reset_action_state(reopen_gripper=True)
@@ -1071,14 +1248,11 @@ class CollectDataApp(tk.Tk):
     def _toggle_gripper(self):
         if not self._require_link():
             return
-        try:
-            angle = GRIPPER_CLOSED_ANGLE if self.gripper_open else GRIPPER_OPEN_ANGLE
-            self.link.set_servo_angle(GRIPPER_SERVO, angle)
-            self.gripper_open = not self.gripper_open
-            self._current_action[3] = float(angle)
-            self.gripper_btn.config(text="Open Clamp" if not self.gripper_open else "Close Clamp")
-        except Exception as e:
-            self._log(f"Command failed: {e}", level="error")
+        angle = GRIPPER_CLOSED_ANGLE if self.gripper_open else GRIPPER_OPEN_ANGLE
+        self.bus.submit(f"servo_angle:{GRIPPER_SERVO}", "set_servo_angle", GRIPPER_SERVO, angle)
+        self.gripper_open = not self.gripper_open
+        self._current_action[3] = float(angle)
+        self.gripper_btn.config(text="Open Clamp" if not self.gripper_open else "Close Clamp")
 
     def _reset_action_state(self, reopen_gripper):
         # Reaches into JointControl's internals -- no public reset() exists upstream.
@@ -1093,11 +1267,10 @@ class CollectDataApp(tk.Tk):
     def _stop_all(self):
         if self.link is None:
             return
-        try:
-            self.link.stop_all()
-            self._log("Stopped all joints.", level="info")
-        except Exception as e:
-            self._log(f"Command failed: {e}", level="error")
+        # Drop anything queued first so a stale speed command can't land after the stop.
+        self.bus.cancel_pending()
+        self.bus.send_now("stop_all")
+        self._log("Stopped all joints.", level="info")
         # stop_all() bypasses JointControl, so a still-held key could desync afterward.
         if self._recording:
             self._log("STOP ALL during recording -- discarding in-progress episode", level="warn")
@@ -1108,15 +1281,18 @@ class CollectDataApp(tk.Tk):
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
         if not isinstance(self.link, CyberBrickWifiLink):
             return
-        try:
-            if self.base_control._current != 0:
-                self.link.set_motor_speed(BASE_MOTOR, self.base_control._current)
-            if self.upper_control._current != 0:
-                self.link.set_servo_speed(UPPER_ARM_SERVO, self.upper_control._current)
-            if self.lower_control._current != 0:
-                self.link.set_servo_speed(LOWER_ARM_SERVO, self.lower_control._current)
-        except Exception as e:
-            self._log(f"WiFi heartbeat resend failed: {e}", level="error")
+        # Queued, not sent inline -- this used to block the main thread every 200ms.
+        # These are the only commands that get re-sent on a timer, which is what
+        # makes them safe to drop when stale (see CommandBus.submit).
+        if self.base_control._current != 0:
+            self.bus.submit(f"motor:{BASE_MOTOR}", "set_motor_speed", BASE_MOTOR,
+                            self.base_control._current, droppable=True)
+        if self.upper_control._current != 0:
+            self.bus.submit(f"servo:{UPPER_ARM_SERVO}", "set_servo_speed", UPPER_ARM_SERVO,
+                            self.upper_control._current, droppable=True)
+        if self.lower_control._current != 0:
+            self.bus.submit(f"servo:{LOWER_ARM_SERVO}", "set_servo_speed", LOWER_ARM_SERVO,
+                            self.lower_control._current, droppable=True)
 
     # -- episode recording --------------------------------------------------
 
@@ -1129,52 +1305,80 @@ class CollectDataApp(tk.Tk):
             return
         if not self._require_link():
             return
-        latest = self.camera.get_latest()
-        if latest is None:
+        if self.camera.get_latest() is None:
             self._log("No camera frame available yet -- wait a moment and try again.", level="warn")
             return
-        frame, _ = latest
+        task = self.task_var.get().strip()
+        if not task:
+            self._log("Enter a task/instruction before recording -- every episode needs one.", level="warn")
+            self.task_entry.focus_set()
+            return
+
+        cam_fps = self.camera.measured_fps
+        if cam_fps and cam_fps < self.args.fps * 0.9:
+            self._log(
+                f"Camera is only sustaining {cam_fps:.1f} fps but the dataset declares "
+                f"{self.args.fps} -- frames will be duplicated. Restart with --fps {int(cam_fps)}.",
+                level="warn",
+            )
+
+        if not self._ensure_recorder():
+            return
         try:
-            self.replay_buffer.start_episode(frame.shape)
+            self.recorder.start_episode()
         except Exception as e:
             self._log(f"Could not start episode: {e}", level="error")
             return
 
-        video_path = os.path.join(self.raw_dir, f"episode_{self._episode_index:06d}.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._video_writer = cv2.VideoWriter(
-            video_path, fourcc, self.args.record_hz, (frame.shape[1], frame.shape[0])
-        )
-        self._video_path = video_path
         self._recording = True
         self._episode_step_count = 0
+        self._episode_missed = 0
+        self._episode_repeats = 0
+        self._last_frame_seq = None
         self._episode_start_mono = time.monotonic()
         self._episode_start_wall = datetime.datetime.now().astimezone().isoformat()
-        self._episode_task = self.task_var.get().strip()
+        self._episode_task = task
+        self._next_deadline = time.monotonic()
         self._set_episode_buttons_state()
+        self._set_review_buttons_state()
         self._update_status_label()
-        self._log(f"Started episode {self._episode_index:06d} -- task: {self._episode_task!r}", level="connected")
+        self._log(f"Started episode {self._n_episodes:06d} -- task: {task!r}", level="connected")
         self.after(0, self._record_tick)
 
     def _record_tick(self):
         if not self._recording:
             return
-        # Reschedule first so an exception below can't silently kill future ticks.
-        self.after(self._record_interval_ms, self._record_tick)
+        # Absolute-deadline scheduling: drift is corrected against the episode
+        # start rather than accumulating one Tk timer rounding error per tick.
+        now = time.monotonic()
+        self._next_deadline += self._period
+        if self._next_deadline <= now:
+            behind = now - self._next_deadline
+            self._episode_missed += int(behind / self._period) + 1
+            self._next_deadline = now + self._period
+        self.after(max(1, int((self._next_deadline - now) * 1000)), self._record_tick)
+
         try:
             latest = self.camera.get_latest()
             if latest is None:
-                self._log("No camera frame available -- skipped a recorded step", level="warn")
+                self._log("No camera frame available -- skipped a step", level="warn")
                 return
-            frame, _cam_ts = latest
+            frame, _cam_ts, seq = latest
+            if seq == self._last_frame_seq:
+                # Camera hasn't produced a new frame within one period. Recording
+                # it keeps the fixed-rate grid honest; the count is reported.
+                self._episode_repeats += 1
+            self._last_frame_seq = seq
+
             action = self._current_action.copy()
-            ts = time.monotonic()
-            # data/img is RGB; cv2 captures BGR. The MP4 backup keeps BGR (what VideoWriter expects).
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            self.replay_buffer.add_step(rgb_frame, action, ts)
-            self._video_writer.write(frame)
+            self.recorder.add_frame(
+                resize_keep_aspect(frame, self.image_size), action, self._episode_task
+            )
             self._episode_step_count += 1
-            self._update_status_label()
+            # Refreshing Tk vars is pointless at 30Hz and this is the one thread
+            # that must not fall behind, so throttle the readout to ~5Hz.
+            if self._episode_step_count % max(1, self.args.fps // 5) == 0:
+                self._update_status_label()
         except Exception as e:
             self._log(f"Recording tick failed: {e} -- discarding episode", level="error")
             self._discard_episode()
@@ -1184,37 +1388,35 @@ class CollectDataApp(tk.Tk):
             self._log("Not currently recording.", level="warn")
             return
         self._recording = False
-        ep_len = self.replay_buffer.end_episode()
-        if self._video_writer is not None:
-            self._video_writer.release()
-            self._video_writer = None
+        elapsed = time.monotonic() - self._episode_start_mono
+        episode_index = self._n_episodes
 
-        if ep_len == 0:
-            self._log(f"Episode {self._episode_index:06d} had 0 steps -- nothing saved", level="warn")
-            if self._video_path and os.path.exists(self._video_path):
-                os.remove(self._video_path)
-            self._video_path = None
+        self._log("Encoding episode video...", level="info")
+        self.update_idletasks()
+        try:
+            ep_len = self.recorder.finish_episode()
+        except Exception as e:
+            self._log(f"Saving episode failed: {e}", level="error")
             self._set_episode_buttons_state()
+            self._set_review_buttons_state()
             self._update_status_label()
             return
 
-        elapsed = time.monotonic() - self._episode_start_mono
-        mean_fps = ep_len / elapsed if elapsed > 0 else 0.0
-        start_idx, end_idx = self.replay_buffer.episode_bounds(self.replay_buffer.n_episodes - 1)
-        for w in validate_episode(self.replay_buffer, start_idx, end_idx, self._video_path):
-            self._log(f"Validation: {w}", level="warn")
+        if ep_len == 0:
+            self._log("Episode had 0 steps -- nothing saved", level="warn")
+        else:
+            achieved = ep_len / elapsed if elapsed > 0 else 0.0
+            level = "warn" if achieved < self.args.fps * 0.9 else "connected"
+            self._log(
+                f"Finished episode {episode_index:06d} -- {ep_len} steps, {achieved:.1f} fps "
+                f"(target {self.args.fps}), {self._episode_missed} missed, "
+                f"{self._episode_repeats} stale frames",
+                level=level,
+            )
+            self._write_session_log(episode_index, ep_len, elapsed, achieved)
 
-        self.metadata.set_camera_info(
-            self.camera.requested_width, self.camera.requested_height, self.camera.requested_fps,
-            self.camera.actual_width, self.camera.actual_height, self.args.record_hz,
-        )
-        self.metadata.add_episode(self._episode_index, self._episode_task, ep_len, self._episode_start_wall, mean_fps)
-        self.metadata.save()
-
-        self._log(f"Finished episode {self._episode_index:06d} -- {ep_len} steps, {mean_fps:.1f} fps", level="connected")
-        self._episode_index += 1
-        self._video_path = None
         self._set_episode_buttons_state()
+        self._set_review_buttons_state()
         self._update_status_label()
 
     def _discard_episode(self):
@@ -1222,39 +1424,101 @@ class CollectDataApp(tk.Tk):
             self._log("Not currently recording.", level="warn")
             return
         self._recording = False
-        ep_len = self.replay_buffer.discard_episode()
-        if self._video_writer is not None:
-            self._video_writer.release()
-            self._video_writer = None
-        if self._video_path and os.path.exists(self._video_path):
-            try:
-                os.remove(self._video_path)
-            except OSError:
-                pass
-        self._video_path = None
-        self._log(f"Discarded episode {self._episode_index:06d} ({ep_len} steps)", level="warn")
+        try:
+            dropped = self.recorder.discard_episode()
+        except Exception as e:
+            self._log(f"Discard failed: {e}", level="error")
+            dropped = 0
+        self._log(f"Discarded in-progress episode ({dropped} steps)", level="warn")
         self._set_episode_buttons_state()
+        self._set_review_buttons_state()
         self._update_status_label()
+
+    def _write_session_log(self, episode_index, ep_len, elapsed, achieved):
+        """Real timing lives here, not in the dataset -- LeRobot's `timestamp`
+        column is the nominal frame_index/fps grid by design."""
+        entry = {
+            "episode_index": episode_index,
+            "task": self._episode_task,
+            "frames": ep_len,
+            "wall_seconds": round(elapsed, 3),
+            "target_fps": self.args.fps,
+            "achieved_fps": round(achieved, 3),
+            "missed_deadlines": self._episode_missed,
+            "stale_frames": self._episode_repeats,
+            "camera_fps": round(self.camera.measured_fps, 3),
+            "start_time": self._episode_start_wall,
+            "command_bus": {k: (round(v, 4) if isinstance(v, float) else v)
+                            for k, v in self.bus.stats().items()},
+        }
+        try:
+            with open(self.session_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError as e:
+            self._log(f"Could not write session log: {e}", level="warn")
+
+    # -- teardown ------------------------------------------------------------
 
     def _quit(self):
         self._shutdown()
 
     def _shutdown(self):
+        """Single exit path for the window close button, Q, SIGINT and any
+        unhandled error. Order matters: stop the robot before anything that
+        can block, and always finalize the dataset."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
         if self._recording:
-            self._log("Shutting down mid-episode -- discarding in-progress episode", level="warn")
-            self._discard_episode()
+            self._recording = False
+            if self.recorder is not None:
+                try:
+                    self.recorder.discard_episode()
+                except Exception:
+                    pass
+            print("Shutting down mid-episode -- in-progress episode discarded", file=sys.stderr)
+
+        # Stop the robot first, synchronously, before anything else can fail.
+        try:
+            self.bus.cancel_pending()
+            self.bus.send_now("stop_all")
+        except Exception:
+            pass
+        try:
+            self.bus.close()
+        except Exception:
+            pass
+
         if self.link is not None:
+            link, self.link = self.link, None
             try:
-                self.link.close()
+                link.close()
             except Exception:
                 pass
-            self.link = None
         if self.camera is not None:
             try:
                 self.camera.stop()
             except Exception:
                 pass
-        self.destroy()
+        self._close_review_video()
+        if self.recorder is None:
+            print("No dataset was created (nothing recorded).", file=sys.stderr)
+        else:
+            try:
+                self.recorder.close()  # finalize(): without it the parquet has no footer
+                print(
+                    f"Dataset finalized: {self._n_episodes} episode(s), "
+                    f"{self._n_frames} frames at {self.dataset_root}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(f"Dataset finalize failed: {e}", file=sys.stderr)
+
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -1272,14 +1536,4 @@ if __name__ == "__main__":
     try:
         app.mainloop()
     finally:
-        # In case mainloop() exits via a path that skipped _shutdown.
-        if getattr(app, "link", None) is not None:
-            try:
-                app.link.close()
-            except Exception:
-                pass
-        if getattr(app, "camera", None) is not None:
-            try:
-                app.camera.stop()
-            except Exception:
-                pass
+        app._shutdown()

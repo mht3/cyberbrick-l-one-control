@@ -22,7 +22,20 @@ STATUS_LED_WIFI = 0x8000FF  # solid purple while running WiFi bridge mode
 # Deadman: if no command arrives for this long (e.g. the WiFi link drops
 # mid-move without a clean TCP close, so readline() would otherwise just
 # block forever), zero all outputs rather than hold the last speed forever.
-COMMAND_DEADMAN_TIMEOUT = 0.5
+#
+# Sized against measured round-trip time, not guessed. On the routed campus
+# path (host and board on different subnets) RTT was 73/378/1116 ms
+# min/avg/max with 17% loss, so the old 0.5s fired constantly *during normal
+# teleop* and zeroed the arm mid-move. 2.0s clears the observed p99 with
+# margin. The cost is that a genuinely dead link now coasts for up to 2s;
+# that is covered by the host sending an explicit STOP on clean disconnect
+# and by handle_client()'s finally block zeroing everything on socket close.
+COMMAND_DEADMAN_TIMEOUT = 2.0
+
+# lwIP numeric fallbacks -- MicroPython builds vary in which of these the
+# socket module actually exports.
+_IPPROTO_TCP = 6
+_TCP_NODELAY = 1
 
 servos = ServosControllerExecMapper()
 motors = MotorsControllerExecMapper()
@@ -32,6 +45,13 @@ motors = MotorsControllerExecMapper()
 # handle_client() and _deadman_watchdog() -- see the latter for why this
 # is a polled timestamp rather than a per-read timeout.
 _last_command_ms = None
+
+# The writer of the currently-served client, so a new connection can evict a
+# stale one. asyncio.start_server() spawns an unbounded handle_client() task
+# per connection and they all share _last_command_ms; with packet loss on the
+# campus path, half-open sessions from a previous run are common, and the old
+# task's finally block stops every motor -- under the live session.
+_active_writer = None
 
 
 def _set_status_led(rgb):
@@ -53,12 +73,41 @@ def start_ap():
     return ap
 
 
+def _disable_power_save(sta):
+    """Turn off WiFi modem power save.
+
+    MicroPython's ESP32 port defaults the station to WIFI_PS_MIN_MODEM, which
+    parks the radio between DTIM beacons and leaves downlink packets sitting in
+    the AP's buffer. For a request/response teleop protocol that shows up as a
+    latency *floor* of tens of milliseconds plus periodic multi-hundred-ms
+    stalls -- measured here as 73ms best case, 378ms average, 1116ms worst.
+    PM_NONE keeps the receiver awake; the board is USB/battery powered on a
+    desk, so the extra draw doesn't matter.
+
+    The core board runs a custom MicroPython build, so neither the constant nor
+    the config key is guaranteed to exist -- report and carry on rather than
+    failing to come up at all.
+    """
+    for pm in (getattr(network.WLAN, 'PM_NONE', None), 0):
+        if pm is None:
+            continue
+        try:
+            sta.config(pm=pm)
+            print(f"[WIFI] power save disabled (pm={pm})")
+            return True
+        except (AttributeError, OSError, ValueError) as e:
+            err = e
+    print(f"[WIFI] could not disable power save ({err}) -- expect high latency")
+    return False
+
+
 def connect_sta(timeout=15):
     """Join STA_SSID. Safe to call whether or not the AP is already up --
     ESP32 handles AP+STA concurrently, sharing one radio, and this doesn't
     touch the AP interface either way."""
     sta = network.WLAN(network.STA_IF)
     sta.active(True)
+    _disable_power_save(sta)
     if not sta.isconnected():
         sta.connect(STA_SSID, STA_PASSWORD)
         deadline = time.time() + timeout
@@ -107,16 +156,57 @@ def handle_command(line):
     return "OK"
 
 
+def _set_nodelay(writer):
+    """Disable Nagle on an accepted connection.
+
+    Every command is a short line answered by a short line, which is the exact
+    shape Nagle plus the peer's delayed ACK punishes: the board holds a small
+    reply waiting for more data to coalesce while the host holds its next
+    command waiting for that reply.
+
+    Best effort, and deliberately catching everything: uasyncio's
+    Stream.get_extra_info() is `return self.e[v]` over a dict that only carries
+    "peername", so asking it for "socket" raises KeyError -- which is not an
+    OSError, escaped an earlier version of this function, and killed the
+    connection before the serve loop even started. The client saw every first
+    command fail with "Connection closed by board". Nagle is an optimization;
+    nothing here is worth dropping a connection over. The socket itself is
+    reachable as Stream.s on MicroPython.
+    """
+    try:
+        sock = getattr(writer, "s", None) or writer.get_extra_info("socket")
+        sock.setsockopt(_IPPROTO_TCP, _TCP_NODELAY, 1)
+        return True
+    except Exception as e:
+        print("[WIFI] TCP_NODELAY unavailable:", e)
+        return False
+
+
 async def handle_client(reader, writer):
-    global _last_command_ms
+    global _last_command_ms, _active_writer
     peer = writer.get_extra_info("peername")
     print("[WIFI] client connected:", peer)
+
+    # Evict whatever was being served before. Doing this here rather than in
+    # the old task's finally block means the newest client always wins, and the
+    # evicted task's cleanup can't stop motors this one is already driving.
+    previous, _active_writer = _active_writer, writer
+    if previous is not None:
+        print("[WIFI] evicting previous client")
+        try:
+            previous.close()
+        except Exception as e:
+            print("[WIFI] evict failed:", e)
+
     _last_command_ms = time.ticks_ms()
     try:
+        _set_nodelay(writer)
         while True:
             line = await reader.readline()
             if not line:
                 break
+            if _active_writer is not writer:
+                break  # superseded by a newer connection
             _last_command_ms = time.ticks_ms()
             reply = handle_command(line.decode().strip())
             if reply == "RESET":
@@ -130,13 +220,20 @@ async def handle_client(reader, writer):
     except Exception as e:
         print("[WIFI] client error:", e)
     finally:
-        _last_command_ms = None
-        motors.stop(1)
-        motors.stop(2)
-        servos.stop(1)
-        servos.stop(2)
-        await writer.wait_closed()
-        print("[WIFI] client disconnected, all stopped")
+        superseded = _active_writer is not writer
+        if not superseded:
+            _active_writer = None
+            _last_command_ms = None
+            motors.stop(1)
+            motors.stop(2)
+            servos.stop(1)
+            servos.stop(2)
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        print("[WIFI] client disconnected"
+              + (", superseded" if superseded else ", all stopped"))
 
 
 async def _deadman_watchdog():
