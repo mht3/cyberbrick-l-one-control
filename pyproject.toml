@@ -5,12 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cyberbrick-l-one-control"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "numpy", "tqdm", "pygame", "matplotlib",
     "wandb", "tensorboard", "scipy", "torch>=2.7", "torchvision",
     "scikit-learn", "pyserial", "opencv-python-headless", "pillow",
-    "lerobot==0.4.4",
+    # [pi] pulls the transformers pi0.5 needs, [dataset] the torchcodec/av stack for
+    # reading video datasets, [training] accelerate for lerobot-train. None of the
+    # three is a core lerobot dependency.
+    "lerobot[pi,dataset,training]==0.6.1",
+    # torchcodec must match the installed torch. lerobot's [dataset] extra allows
+    # >=0.3.0,<0.12.0, and pip would take the newest -- which is built against a
+    # newer torch and fails to load with `Symbol not found: c10::MessageLogger`.
+    # 0.3.0 is the build matching torch 2.7.
     "torchcodec==0.3.0",
 ]
 

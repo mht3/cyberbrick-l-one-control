@@ -230,3 +230,7 @@ datasets/
 # LeRobot datasets and collection session logs
 data/
 logs/
+
+# Training checkpoints and local wandb runs (lerobot-train writes outputs/train/<date>/)
+outputs/
+wandb/

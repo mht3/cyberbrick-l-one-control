@@ -6,7 +6,7 @@ broken dataset can still be inspected. An empty list means everything passed.
 
 import numpy as np
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.features import ACTION_DIM, ACTION_NAMES, CAMERA_KEY
@@ -54,17 +54,16 @@ def validate_dataset(ds):
 
 
 def _check_stats(ds):
-    """Catches the lerobot 0.4.4 uint8 overflow that silently zeroes every image
-    std (see _widen_image_stats_to_float32 in lone_data/lerobot_recorder.py).
-    A zero std is invisible at training time -- the normalizer just divides by
-    1e-8 -- so it has to be checked here."""
+    """A zero std is invisible at training time -- the normalizer just divides by
+    1e-8 -- so it has to be checked here. lerobot once overflowed uint8 images into
+    a zero std; fixed as of 0.6.1, but cheap to keep watching for."""
     warnings = []
     stats = getattr(ds.meta, "stats", None)
     if not stats:
         return ["dataset has no meta/stats.json"]
     causes = {
-        CAMERA_KEY: "the lerobot uint8 stats overflow is back -- see "
-                    "_widen_image_stats_to_float32 in lone_data/lerobot_recorder.py",
+        CAMERA_KEY: "lerobot's uint8 stats overflow is back; image normalization "
+                    "would divide by ~1e-8",
         ACTION: "every action dimension is constant across the whole dataset, "
                 "so there is nothing for a policy to learn from it",
     }
@@ -147,20 +146,16 @@ def _check_tasks(ds):
 
 
 def describe_state_policy_support(ds):
-    """L-ONE records no proprioception, so `observation.state` is absent by
-    design. Reports which policies that rules in and out."""
-    has_state = OBS_STATE in ds.meta.features
-    if has_state:
-        return f"{OBS_STATE} present -- all policies supported"
+    """L-ONE measures nothing, so `observation.state` is present but all zeros --
+    the shape every policy requires, carrying no information."""
+    if OBS_STATE not in ds.meta.features:
+        return (
+            f"{OBS_STATE} absent. ACT and pi0/pi0.5 raise without a state tensor, and\n"
+            "  Diffusion Policy and SmolVLA cannot even build. Run scripts/add_state_column.py."
+        )
     return (
-        f"{OBS_STATE} absent (L-ONE has no proprioceptive sensors).\n"
-        "  usable as-is:  ACT -- every state use is guarded, the docstring marks it optional\n"
-        "  needs a state supplied at train time:\n"
-        "                 Pi0 / Pi0.5 / Pi0-FAST / GR00T. PI05Config.validate_features() injects\n"
-        "                 a padded state *feature* (shapes and normalization wiring), but that is\n"
-        "                 not a state *tensor*: Pi05PrepareStateTokenizerProcessorStep raises\n"
-        "                 ValueError('State is required for PI05') on a batch without one, because\n"
-        "                 pi0.5 discretizes the state into the text prompt. No config flag disables\n"
-        "                 this in any current lerobot release.\n"
-        "  unusable:      Diffusion Policy, SmolVLA (both read robot_state_feature unconditionally)"
+        f"{OBS_STATE} present and all zeros -- L-ONE has no proprioceptive sensors.\n"
+        "  Every policy accepts this schema, and every one of them is vision-only in\n"
+        "  substance: ACT and pi0.5 never feed the state to the network at all, and\n"
+        "  Diffusion Policy and SmolVLA feed in a constant."
     )

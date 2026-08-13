@@ -16,7 +16,7 @@ import lone_data  # noqa: F401  -- disables Hub access before lerobot is importe
 
 import lerobot
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION
 
 from lone_data.features import ACTION_NAMES, ACTION_SEMANTICS, CAMERA_KEY, SYNC_NOTE, ZERO_DISPATCH_CONVENTION

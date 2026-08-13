@@ -1,19 +1,9 @@
 """Canonical LeRobot feature schema for L-ONE demonstrations.
 
-L-ONE is RGB-only: one webcam, no encoders, no proprioception of any kind. The
-dataset therefore has no `observation.state`, and inventing one would mean
-writing fabricated sensor readings into a dataset other people may train on.
-
-That is a real constraint at training time, not a solved one. ACT handles it --
-every state use is guarded. pi0/pi0.5 do not: PI05Config.validate_features()
-injects a padded OBS_STATE *feature* and fills unused camera slots, but the
-feature only carries shapes and normalization wiring. At runtime
-Pi05PrepareStateTokenizerProcessorStep raises ValueError("State is required for
-PI05") on a batch that has no state tensor, because pi0.5 discretizes the state
-into the text prompt ("Task: ..., State: <256 bins>; Action: "). No config flag
-turns that off in any current lerobot release, so training pi0.5 on this data
-means supplying a state from outside the dataset. Diffusion Policy and SmolVLA
-read robot_state_feature unconditionally and can't train on this data at all.
+L-ONE has one webcam and no proprioception of any kind. `observation.state` holds
+the per-joint angles an encodered arm would report, and is all zeros here, so the
+dataset has the shape every LeRobot policy expects while claiming no sensor
+readings it cannot take -- see STATE_NAMES.
 
 Feature names come from lerobot.utils.constants because
 dataset_to_policy_features() matches "action" exactly and anything starting
@@ -23,7 +13,7 @@ action column would be invisible to every LeRobot policy.
 
 import cv2
 
-from lerobot.utils.constants import ACTION, OBS_IMAGES
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 CAMERA_KEY = f"{OBS_IMAGES}.front"
 ROBOT_TYPE = "cyberbrick-l-one"
@@ -46,6 +36,28 @@ ACTION_NAMES = [
     "gripper_angle",
 ]
 ACTION_DIM = len(ACTION_NAMES)
+
+# The joint configuration an encodered arm would report: one angle per DOF, in the
+# same order as ACTION_NAMES so index i is the same joint in both. These are
+# angles, not the speeds the action space commands -- proprioception measures
+# where a joint *is*, while dimensions 0-2 of the action say how fast to drive it.
+#
+# On L-ONE it is ALL ZEROS. There are no encoders and no read-back path to the
+# host, so nothing real can go here. The column exists for its shape: every
+# LeRobot policy expects the key, and omitting it makes ACT and pi0/pi0.5 raise
+# and Diffusion Policy and SmolVLA unbuildable. Zeros state "this robot reports
+# no joint angles" in the format policies already understand.
+#
+# Every L-ONE policy is therefore vision-only in substance, whatever its
+# architecture allows. Do not read meaning into this column, and do not fill it
+# with commands -- a command is not a measurement.
+STATE_NAMES = [
+    "base_angle",
+    "upper_arm_angle",
+    "lower_arm_angle",
+    "gripper_angle",
+]
+STATE_DIM = len(STATE_NAMES)
 
 # What each action dimension physically is. Every value is a *command* sent to
 # the board -- L-ONE reports nothing back, so none of these are measurements.
@@ -89,6 +101,31 @@ ACTION_SEMANTICS = [
     },
 ]
 
+# The envelope teleop actually commands, per dimension -- NOT the hardware range
+# in ACTION_SEMANTICS above. MOTOR1 accepts -2048..2048 but virtual_gripper.py
+# drives it at MOTOR_SPEED = 900, so normalizing against the hardware range would
+# leave 56% of the policy's output span unreachable.
+#
+# These exist because normalization statistics estimated from recorded actions
+# are unreliable here: teleop emits three discrete levels per channel, so a
+# session where a joint happened to move in only one direction yields a
+# degenerate range. With the first recorded episode, dim 0 had min=-900 max=0,
+# which maps the most common action (0, stopped) onto the extreme of the
+# normalized range and pushes a future +900 outside it entirely.
+#
+# The limits are known exactly, so they are declared rather than estimated. Keep
+# in sync with virtual_gripper.py: MOTOR_SPEED, JOINT_SPEED, GRIPPER_OPEN_ANGLE,
+# GRIPPER_CLOSED_ANGLE. scripts/fix_action_stats.py writes them into a dataset's
+# meta/stats.json; rerun it after every collection session, because
+# LeRobotDataset.save_episode() recomputes and overwrites that file each time.
+ACTION_COMMAND_LIMITS = [
+    (-900.0, 900.0),  # base_motor_speed      -- virtual_gripper.MOTOR_SPEED
+    (-100.0, 100.0),  # upper_arm_servo_speed -- virtual_gripper.JOINT_SPEED
+    (-100.0, 100.0),  # lower_arm_servo_speed -- virtual_gripper.JOINT_SPEED
+    (30.0, 120.0),    # gripper_angle         -- OPEN_ANGLE .. CLOSED_ANGLE
+]
+
+
 ZERO_DISPATCH_CONVENTION = (
     "For dimensions 0-2, an action value of 0 was dispatched via stop_motor()/stop_servo(), "
     "NOT set_speed(idx, 0) -- a motor's stop() sets both H-bridge PWM channels to duty 100 "
@@ -113,6 +150,11 @@ def lone_features(image_size=DEFAULT_IMAGE_SIZE):
             "dtype": "video",
             "shape": (h, w, 3),
             "names": ["height", "width", "channel"],
+        },
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": (STATE_DIM,),
+            "names": STATE_NAMES,
         },
         ACTION: {
             "dtype": "float32",

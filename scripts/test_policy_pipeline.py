@@ -5,7 +5,7 @@
 
 Runs on CPU with no weights and no network: it reproduces exactly what
 make_policy() does when wiring dataset features into a policy config
-(factory.py:457-471), then checks what each policy makes of an RGB-only
+then checks what each policy makes of an RGB-only
 dataset. Exits non-zero if anything doesn't match expectations.
 """
 
@@ -22,10 +22,10 @@ import lone_data  # noqa: F401  -- disables Hub access before lerobot is importe
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-from lone_data.features import ACTION_DIM, CAMERA_KEY
+from lone_data.features import ACTION_DIM, CAMERA_KEY, STATE_DIM
 
 DEFAULT_ROOT = "data/lerobot/lone/l_one"
 
@@ -65,79 +65,106 @@ def main():
     types = {ft.type for ft in features.values()}
     check("VISUAL feature reaches policies", FeatureType.VISUAL in types)
     check("ACTION feature reaches policies", FeatureType.ACTION in types)
-    check("no observation.state in dataset", OBS_STATE not in ds.meta.features)
+    check("STATE feature reaches policies", FeatureType.STATE in types)
 
-    # -- pi0.5: the state slot is the policy's job, not the dataset's ------
+    # The state exists for its shape, not its contents. If it ever stops being
+    # all zeros, something started writing commands into it -- see STATE_NAMES.
+    state = np.stack([np.asarray(ds[i][OBS_STATE]) for i in range(min(64, len(ds)))])
+    check(
+        "observation.state is all zeros",
+        bool((state == 0).all()),
+        f"shape={tuple(state.shape)}",
+    )
+
+    # -- pi0.5 ------------------------------------------------------------
     print("\npi05 (the intended training path)")
     from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
     pi05 = wire(PI05Config(empty_cameras=2), features)
-    check(
-        "PI05Config injects an observation.state feature",
-        OBS_STATE in pi05.input_features
-        and tuple(pi05.input_features[OBS_STATE].shape) == (pi05.max_state_dim,),
-        f"shape={tuple(pi05.input_features[OBS_STATE].shape)}",
-    )
     empty_cams = [k for k in pi05.input_features if "empty_camera" in k]
     check("PI05Config fills the 2 unused camera slots", len(empty_cams) == 2, str(empty_cams))
     check("PI05Config sees our camera", CAMERA_KEY in pi05.input_features)
+    check("PI05Config sees our state", OBS_STATE in pi05.input_features)
     check("PI05Config outputs action", ACTION in pi05.output_features)
 
-    # The config check above is necessary but NOT sufficient, and believing
-    # otherwise is exactly the trap: validate_features() injects a state
-    # *feature* (shapes, normalization wiring) while the runtime pipeline still
-    # demands a state *tensor* in the batch. pi0.5 discretizes the state into
-    # the text prompt, so it is structurally required. Assert the real behavior
-    # here rather than discovering it partway into a training run.
+    # pi0.5 discretizes the state into the text prompt and raises without one, so
+    # a config that merely declares the feature is not enough -- assert that the
+    # dataset's own tensor satisfies the runtime, and that a constant state
+    # contributes only a constant prefix.
     from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
-    from lerobot.processor.core import TransitionKey
+    from lerobot.processor import TransitionKey
 
     step = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=pi05.max_state_dim)
     transition = {
-        TransitionKey.OBSERVATION: {CAMERA_KEY: torch.zeros(1, 3, 224, 224)},
+        TransitionKey.OBSERVATION: {
+            CAMERA_KEY: torch.zeros(1, 3, 224, 224),
+            OBS_STATE: torch.zeros(1, STATE_DIM),
+        },
         TransitionKey.COMPLEMENTARY_DATA: {"task": ["Pick up the green marker."]},
     }
-    try:
-        step(transition)
-        raised = None
-    except ValueError as e:
-        raised = str(e)
+    prompt = step(transition)[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
+    bins = set(prompt.split("State: ")[1].split(";")[0].split())
     check(
-        "pi05 runtime requires a state tensor the dataset does not have",
-        raised is not None and "State is required" in raised,
-        f"ValueError: {raised}" if raised else "no error -- lerobot made state optional, "
-        "so this dataset can now train pi05 unmodified; drop this check",
+        "pi05 tokenizes the state into a constant prompt prefix",
+        bins == {"128"},
+        f"{len(bins)} distinct bin value(s): {sorted(bins)}",
     )
 
-    # -- ACT: no injection, but every state use is guarded ----------------
-    print("\nact (vision-only baseline)")
+    # -- ACT --------------------------------------------------------------
+    print("\nact (cheaper baseline)")
     from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.act.modeling_act import ACTPolicy
 
-    act = wire(ACTConfig(), features)
-    check("ACTConfig accepts a state-less dataset", act.robot_state_feature is None)
+    # pretrained_backbone_weights would fetch resnet18; keep this script offline.
+    act = wire(ACTConfig(pretrained_backbone_weights=None, chunk_size=8, n_action_steps=8,
+                         device="cpu"), features)
     check("ACTConfig sees our camera", CAMERA_KEY in act.input_features)
+    check(
+        "ACTConfig sees our state",
+        act.robot_state_feature is not None
+        and tuple(act.robot_state_feature.shape) == (STATE_DIM,),
+    )
 
-    # -- policies that genuinely need proprioception ----------------------
-    print("\npolicies that require proprioception (expected to be unusable)")
+    # A clean config is necessary but not sufficient -- run a real batch through.
+    act_policy = ACTPolicy(act)
+    act_batch = torch.utils.data.default_collate(
+        [
+            {CAMERA_KEY: torch.zeros(3, 224, 224), OBS_STATE: torch.zeros(STATE_DIM),
+             ACTION: torch.zeros(act.chunk_size, ACTION_DIM),
+             "action_is_pad": torch.zeros(act.chunk_size, dtype=torch.bool)}
+            for _ in range(2)
+        ]
+    )
+    act_policy.train()
+    loss, _ = act_policy.forward(act_batch)
+    check("ACT trains on this schema", torch.isfinite(loss).item(), f"loss={float(loss):.3f}")
+
+    # -- policies that read the state into the model ----------------------
+    # These build fine now that the column exists, but the column is zeros, so
+    # what they gain is a shape rather than information.
+    print("\npolicies that consume the state directly")
     from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
     from lerobot.policies.diffusion.modeling_diffusion import DiffusionModel
 
     dp = wire(DiffusionConfig(), features)
-    check("DiffusionConfig has no robot_state_feature", dp.robot_state_feature is None)
+    check(
+        "DiffusionConfig sees our state",
+        dp.robot_state_feature is not None
+        and tuple(dp.robot_state_feature.shape) == (STATE_DIM,),
+    )
     try:
         DiffusionModel(dp)
-        check("DiffusionModel rejects a state-less dataset", False, "it built without error")
-    except AttributeError as e:
-        check("DiffusionModel rejects a state-less dataset", True, f"AttributeError: {e}")
+        check("DiffusionModel builds", True)
+    except ImportError as e:
+        # lerobot[diffusion] is not installed -- nothing here needs it.
+        print(f"  SKIP  DiffusionModel builds  {e}")
+    except Exception as e:
+        check("DiffusionModel builds", False, f"{type(e).__name__}: {e}")
 
     from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
     smolvla = wire(SmolVLAConfig(), features)
-    check(
-        "SmolVLAConfig has no robot_state_feature",
-        smolvla.robot_state_feature is None,
-        "(modeling_smolvla reads batch[OBS_STATE] unconditionally)",
-    )
+    check("SmolVLAConfig sees our state", smolvla.robot_state_feature is not None)
 
     # -- a real batch, the shape training consumes ------------------------
     print("\nbatch")
@@ -164,9 +191,9 @@ def main():
         print(f"\nFAILED: {len(failures)} check(s): {failures}")
         return 1
     print(
-        "\nAll checks passed -- a standard LeRobotDataset, trainable as-is with ACT.\n"
-        "pi0/pi0.5 additionally need an observation.state tensor supplied at train time;\n"
-        "the dataset deliberately provides none (L-ONE has no proprioceptive sensors)."
+        "\nAll checks passed -- a standard LeRobotDataset every policy above accepts.\n"
+        "observation.state is all zeros: L-ONE measures nothing, so the column carries the\n"
+        "shape policies require and no information. Every L-ONE policy is vision-only."
     )
     return 0
 

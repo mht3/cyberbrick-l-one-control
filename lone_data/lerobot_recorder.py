@@ -15,49 +15,19 @@ import os
 import shutil
 
 import numpy as np
-from lerobot.datasets import compute_stats as _lerobot_compute_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.features import (
     ACTION_DIM,
     CAMERA_KEY,
     DEFAULT_IMAGE_SIZE,
     ROBOT_TYPE,
+    STATE_DIM,
     lone_features,
 )
 
 
-def _widen_image_stats_to_float32():
-    """Work around a lerobot 0.4.4 bug that makes every image std exactly 0.
-
-    compute_episode_stats() feeds sample_images()'s uint8 array straight into
-    RunningQuantileStats.update(), which evaluates `batch**2`. On uint8 that
-    overflows mod 256, so E[x^2] comes out around 127 while E[x]^2 is around
-    4147; the variance is negative, np.maximum(0, variance) clamps it to zero,
-    and std is 0.0 for every channel.
-
-    Nothing downstream notices: the normalizer just divides by (0 + 1e-8), so
-    any policy that MEAN_STD-normalizes images (ACT, Diffusion) trains on
-    values around 1e7. pi0.5 escapes only because it maps VISUAL to IDENTITY.
-
-    Widening to float32 before the reduction is the whole fix -- compute_
-    episode_stats still divides by 255 afterwards, so the values it produces
-    are unchanged in every other respect. Remove this once lerobot fixes it
-    upstream (verify with scripts/validate_dataset.py, which now checks std).
-    """
-    original = _lerobot_compute_stats.sample_images
-    if getattr(original, "_lone_widened", False):
-        return
-
-    def sample_images_float32(image_paths):
-        return original(image_paths).astype(np.float32)
-
-    sample_images_float32._lone_widened = True
-    _lerobot_compute_stats.sample_images = sample_images_float32
-
-
-_widen_image_stats_to_float32()
 
 
 def _read_info(root):
@@ -253,7 +223,9 @@ class LoneRecorder:
         if rgb.shape != (*self.image_size, 3) or rgb.dtype != np.uint8:
             raise ValueError(f"Frame {rgb.shape}/{rgb.dtype} != {(*self.image_size, 3)}/uint8")
 
-        self.dataset.add_frame({CAMERA_KEY: rgb, ACTION: action, "task": task})
+        # Always zeros -- L-ONE measures nothing. See STATE_NAMES in features.py.
+        state = np.zeros(STATE_DIM, dtype=np.float32)
+        self.dataset.add_frame({CAMERA_KEY: rgb, OBS_STATE: state, ACTION: action, "task": task})
         self._pending_actions.append(action)
         self._pending_task = task
         self._frames += 1
