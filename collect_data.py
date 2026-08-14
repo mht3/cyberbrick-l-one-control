@@ -51,8 +51,7 @@ from virtual_gripper import (
     pick_default_port,
 )
 
-from lone_data.camera import CameraStream
-from lone_data.camera_stream import CameraStreamReceiver
+from lone_data import camera_source
 from lone_data.command_bus import CommandBus
 from lone_data.features import (
     ACTION_DIM,
@@ -177,12 +176,14 @@ class CollectDataApp(tk.Tk):
         self.bus.start()
 
         # -- camera -------------------------------------------------------
-        if args.remote_camera:
-            self.camera = CameraStreamReceiver(port=args.remote_camera_port)
-        else:
-            # Opened on the main thread so macOS's camera-permission prompt gets a run loop.
-            self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
-        self.camera.start()
+        # Selected from the toolbar and swappable at runtime, so a machine with no
+        # local camera still opens -- pick the remote source and carry on. A failure
+        # here is logged rather than fatal for the same reason.
+        self.camera = None
+        self._camera_source = camera_source.pick_initial_source(
+            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index
+        )
+        self._camera_connected = False
 
         # -- dataset --------------------------------------------------------
         # Not created here. LeRobot writes meta/info.json the moment a dataset
@@ -190,7 +191,7 @@ class CollectDataApp(tk.Tk):
         # time the app is opened and closed without recording. Deferred to the
         # first episode -- see _ensure_recorder().
         self.image_size = (args.image_height, args.image_width)
-        self._check_storage_aspect()
+        self._aspect_error = None  # set by _check_storage_aspect once a camera is up
         root = args.root or os.path.join(REPO_DIR, "data", "lerobot", *args.repo_id.split("/"))
         self.dataset_root = os.path.abspath(root)
         self.recorder = None
@@ -240,6 +241,17 @@ class CollectDataApp(tk.Tk):
         video_group = ttk.Frame(camera_frame)
         video_group.pack(anchor="n")
 
+        source_row = ttk.Frame(video_group)
+        source_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(source_row, text="Camera").pack(side="left")
+        self.camera_source_var = tk.StringVar(value=self._camera_source_label(self._camera_source))
+        self.camera_combo = ttk.Combobox(
+            source_row, textvariable=self.camera_source_var, width=22, state="readonly",
+            postcommand=self._refresh_camera_sources,
+        )
+        self.camera_combo.pack(side="left", padx=(8, 0))
+        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_source)
+
         self.camera_label = ttk.Label(video_group)
         self.camera_label.pack()
 
@@ -284,6 +296,14 @@ class CollectDataApp(tk.Tk):
 
         self._log(f"Dataset will be written to {self.dataset_root} @ {args.fps} fps", level="info")
 
+        # After the log panel exists, so a camera that will not open reports itself
+        # in the GUI instead of taking the process down before there is a GUI.
+        if self._open_camera(self._camera_source):
+            self._check_storage_aspect()
+        elif self._camera_source != camera_source.REMOTE_SOURCE:
+            self._log("Pick another source from the Camera dropdown, or run "
+                      "stream_camera.py elsewhere and choose Remote.", level="warn")
+
         self.after(0, self._update_camera_feed)
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
 
@@ -293,22 +313,97 @@ class CollectDataApp(tk.Tk):
         # Lets Ctrl+C get delivered promptly -- mainloop() doesn't check for signals on its own.
         self.after(200, self._signal_pump)
 
+    # -- camera source -------------------------------------------------------
+
+    def _camera_fps(self):
+        return self.camera.measured_fps if self.camera is not None else 0.0
+
+    def _camera_source_label(self, source):
+        return camera_source.source_label(source, self.args.remote_camera_port)
+
+    def _refresh_camera_sources(self):
+        sources = camera_source.available_sources(self._camera_source, self.camera is not None)
+        values = [self._camera_source_label(s) for s in sources]
+        current = self._camera_source_label(self._camera_source)
+        if current not in values:
+            values.insert(0, current)
+        self.camera_combo["values"] = values
+
+    def _open_camera(self, source):
+        """Swap to `source`, returning True on success. Never raises: a camera that
+        will not open must leave the app usable so another source can be chosen."""
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+            self.camera = None
+        try:
+            self.camera = camera_source.open_source(
+                source, self.args.remote_camera_port,
+                self.args.width, self.args.height, self.args.camera_fps,
+            )
+        except Exception as e:
+            self._log(f"{self._camera_source_label(source)}: {e}", level="error")
+            return False
+        self._camera_source = source
+        # Cleared so the next frame to arrive announces itself -- for the remote
+        # receiver, binding the port says nothing about a sender being there.
+        self._camera_connected = False
+        if source == camera_source.REMOTE_SOURCE:
+            self._log(f"Waiting for a sender on port {self.args.remote_camera_port} "
+                      "(run stream_camera.py on the machine with the camera)")
+        else:
+            self._log(f"Opened {self._camera_source_label(source)}")
+        return True
+
+    def _note_camera_connected(self):
+        """Log the first frame from the current source, once."""
+        if self._camera_connected or self.camera is None:
+            return
+        self._camera_connected = True
+        w, h = self.camera.actual_width, self.camera.actual_height
+        self._log(f"Receiving frames from {self._camera_source_label(self._camera_source)}"
+                  f" ({w}x{h})", level="connected")
+
+    def _on_camera_source(self, event=None):
+        source = camera_source.parse_label(self.camera_source_var.get())
+        if source is None:
+            return
+        if source == self._camera_source and self.camera is not None:
+            return
+        if self._recording:
+            self._log("Finish or discard the episode before switching camera.", level="warn")
+            self.camera_source_var.set(self._camera_source_label(self._camera_source))
+            return
+        if self._open_camera(source):
+            self._check_storage_aspect()
+        self.camera_source_var.set(self._camera_source_label(self._camera_source))
+
     def _check_storage_aspect(self):
         """Frames are downscaled, never cropped or padded, so a stored size
         whose aspect ratio doesn't match the camera's silently stretches every
-        frame in the dataset. Refuse up front instead."""
+        frame in the dataset. Refuse up front instead.
+
+        Once the camera is switchable this can no longer exit the process -- the
+        operator is mid-session and can simply pick another source -- so a mismatch
+        is reported and recording is blocked by _start_episode instead."""
+        self._aspect_error = None
+        if self.camera is None:
+            return
         store_h, store_w = self.image_size
         cam_w, cam_h = self.camera.actual_width, self.camera.actual_height
         if not cam_w or not cam_h:
             return
         if abs((store_w / store_h) - (cam_w / cam_h)) > 0.01:
-            raise SystemExit(
+            self._aspect_error = (
                 f"--image-width/--image-height {store_w}x{store_h} "
                 f"({store_w / store_h:.3f}:1) does not match the camera's "
-                f"{cam_w}x{cam_h} ({cam_w / cam_h:.3f}:1).\n"
+                f"{cam_w}x{cam_h} ({cam_w / cam_h:.3f}:1). "
                 "Frames are scaled, not cropped or padded, so this would distort every frame. "
                 f"Use a size with the camera's aspect ratio (e.g. {cam_w // 2}x{cam_h // 2})."
             )
+            self._log(self._aspect_error, level="error")
 
     # -- dataset (created lazily, on the first episode) ------------------
 
@@ -859,7 +954,7 @@ class CollectDataApp(tk.Tk):
             )
             achieved = self._episode_step_count / elapsed if elapsed > 0 else 0.0
             self.rate_var.set(
-                f"{achieved:.1f}/{self.args.fps} fps  ·  camera {self.camera.measured_fps:.1f} fps  ·  "
+                f"{achieved:.1f}/{self.args.fps} fps  ·  camera {self._camera_fps():.1f} fps  ·  "
                 f"missed {self._episode_missed}  ·  stale frames {self._episode_repeats}  ·  "
                 f"{self._link_readout()}"
             )
@@ -868,7 +963,7 @@ class CollectDataApp(tk.Tk):
                 f"Idle -- {self._n_episodes} episode(s), {self._n_frames} frames"
             )
             self.rate_var.set(
-                f"camera {self.camera.measured_fps:.1f} fps  ·  {self._link_readout()}"
+                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
             )
 
     # -- review mode: play back recorded episodes ------------------------
@@ -1188,6 +1283,16 @@ class CollectDataApp(tk.Tk):
 
     # -- camera feed ------------------------------------------------------
 
+    def _show_camera_placeholder(self):
+        """Stand-in for the video pane when no frames are arriving."""
+        canvas = camera_source.placeholder_frame(
+            self.image_size, self.camera, self._camera_source,
+            self.args.remote_camera_port, DISPLAY_MAX_WIDTH,
+        )
+        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
+        self.camera_label.configure(image=photo)
+        self.camera_label.image = photo
+
     def _update_camera_feed(self):
         self.after(FEED_REFRESH_MS, self._update_camera_feed)
         if self._review_mode:
@@ -1197,9 +1302,11 @@ class CollectDataApp(tk.Tk):
         self._feed_ticks += 1
         if not self._recording and self._feed_ticks % max(1, 1000 // FEED_REFRESH_MS) == 0:
             self._update_status_label()
-        latest = self.camera.get_latest()
+        latest = self.camera.get_latest() if self.camera is not None else None
         if latest is None:
+            self._show_camera_placeholder()
             return
+        self._note_camera_connected()
         frame, _ts, _seq = latest
         # Downscale first, then annotate -- drawing on the full-res frame costs a
         # 2.7MB copy per refresh on the same thread the record tick runs on.
@@ -1314,8 +1421,16 @@ class CollectDataApp(tk.Tk):
             return
         if not self._require_link():
             return
+        if self.camera is None:
+            self._log("No camera selected -- choose a source from the Camera dropdown.", level="warn")
+            return
         if self.camera.get_latest() is None:
             self._log("No camera frame available yet -- wait a moment and try again.", level="warn")
+            return
+        if self._aspect_error:
+            # Was a SystemExit at startup; with a switchable camera it blocks
+            # recording instead, so the operator can just pick a matching source.
+            self._log(f"Refusing to record: {self._aspect_error}", level="error")
             return
         task = self.task_var.get().strip()
         if not task:
@@ -1323,7 +1438,7 @@ class CollectDataApp(tk.Tk):
             self.task_entry.focus_set()
             return
 
-        cam_fps = self.camera.measured_fps
+        cam_fps = self._camera_fps()
         if cam_fps and cam_fps < self.args.fps * 0.9:
             self._log(
                 f"Camera is only sustaining {cam_fps:.1f} fps but the dataset declares "
@@ -1368,7 +1483,7 @@ class CollectDataApp(tk.Tk):
         self.after(max(1, int((self._next_deadline - now) * 1000)), self._record_tick)
 
         try:
-            latest = self.camera.get_latest()
+            latest = self.camera.get_latest() if self.camera is not None else None
             if latest is None:
                 self._log("No camera frame available -- skipped a step", level="warn")
                 return
@@ -1455,7 +1570,7 @@ class CollectDataApp(tk.Tk):
             "achieved_fps": round(achieved, 3),
             "missed_deadlines": self._episode_missed,
             "stale_frames": self._episode_repeats,
-            "camera_fps": round(self.camera.measured_fps, 3),
+            "camera_fps": round(self._camera_fps(), 3),
             "start_time": self._episode_start_wall,
             "command_bus": {k: (round(v, 4) if isinstance(v, float) else v)
                             for k, v in self.bus.stats().items()},

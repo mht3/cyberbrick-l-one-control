@@ -52,8 +52,7 @@ from virtual_gripper import (
     list_usb_ports,
 )
 
-from lone_data.camera import CameraStream
-from lone_data.camera_stream import CameraStreamReceiver
+from lone_data import camera_source
 from lone_data.command_bus import CommandBus
 from lone_data.dispatch import clamp_to_limits, dispatch_action, snap_to_levels
 from lone_data.features import ACTION_DIM, ACTION_NAMES, DEFAULT_IMAGE_SIZE, resize_keep_aspect
@@ -264,16 +263,24 @@ class DeployApp(tk.Tk):
         )
         self.bus.start()
 
-        if args.remote_camera:
-            self.camera = CameraStreamReceiver(port=args.remote_camera_port)
-        else:
-            self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
-        self.camera.start()
+        # Selected from the toolbar and swappable at runtime, so a machine with no
+        # local camera still opens -- pick the remote source and carry on.
+        self.camera = None
+        self._camera_source = camera_source.pick_initial_source(
+            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index
+        )
+        self._camera_connected = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._shutdown)
         self.bind("<space>", lambda e: self._stop_all())
         self.bind("q", lambda e: self._shutdown())
+
+        # After _build_ui so a camera that will not open reports itself in the GUI
+        # rather than taking the process down before there is a GUI.
+        if not self._open_camera(self._camera_source):
+            self._log("Pick another source from the Camera dropdown, or run "
+                      "stream_camera.py elsewhere and choose Remote.", "warn")
 
         if args.checkpoint:
             self._set_checkpoint(args.checkpoint)
@@ -333,8 +340,22 @@ class DeployApp(tk.Tk):
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True)
-        self.feed = ttk.Label(body)
-        self.feed.pack(side="left", padx=(0, 10))
+
+        feed_group = ttk.Frame(body)
+        feed_group.pack(side="left", padx=(0, 10), anchor="n")
+        source_row = ttk.Frame(feed_group)
+        source_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(source_row, text="Camera").pack(side="left")
+        self.camera_source_var = tk.StringVar(value=self._camera_source_label(self._camera_source))
+        self.camera_combo = ttk.Combobox(
+            source_row, textvariable=self.camera_source_var, width=22, state="readonly",
+            postcommand=self._refresh_camera_sources,
+        )
+        self.camera_combo.pack(side="left", padx=(8, 0))
+        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_source)
+
+        self.feed = ttk.Label(feed_group)
+        self.feed.pack()
         self._build_plot(body)
 
         self.status_var = tk.StringVar(value="Idle.")
@@ -359,6 +380,77 @@ class DeployApp(tk.Tk):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         self.log.insert("end", f"[{stamp}] {message}\n")
         self.log.see("end")
+
+    # -- camera source -------------------------------------------------------
+
+    def _camera_source_label(self, source):
+        return camera_source.source_label(source, self.args.remote_camera_port)
+
+    def _refresh_camera_sources(self):
+        sources = camera_source.available_sources(self._camera_source, self.camera is not None)
+        values = [self._camera_source_label(s) for s in sources]
+        current = self._camera_source_label(self._camera_source)
+        if current not in values:
+            values.insert(0, current)
+        self.camera_combo["values"] = values
+
+    def _open_camera(self, source):
+        """Swap to `source`, returning True on success. Never raises -- a camera that
+        will not open must leave the app usable so another source can be chosen."""
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+            self.camera = None
+        try:
+            self.camera = camera_source.open_source(
+                source, self.args.remote_camera_port,
+                self.args.width, self.args.height, self.args.camera_fps,
+            )
+        except Exception as e:
+            self._log(f"{self._camera_source_label(source)}: {e}", "error")
+            return False
+        self._camera_source = source
+        # Cleared so the next frame announces itself -- for the remote receiver,
+        # binding the port says nothing about a sender being there.
+        self._camera_connected = False
+        if source == camera_source.REMOTE_SOURCE:
+            self._log(f"Waiting for a sender on port {self.args.remote_camera_port} "
+                      "(run stream_camera.py on the machine with the camera)")
+        else:
+            self._log(f"Opened {self._camera_source_label(source)}")
+        return True
+
+    def _note_camera_connected(self):
+        """Log the first frame from the current source, once."""
+        if self._camera_connected or self.camera is None:
+            return
+        self._camera_connected = True
+        w, h = self.camera.actual_width, self.camera.actual_height
+        self._log(f"Receiving frames from {self._camera_source_label(self._camera_source)} ({w}x{h})")
+
+    def _on_camera_source(self, event=None):
+        source = camera_source.parse_label(self.camera_source_var.get())
+        if source is None or (source == self._camera_source and self.camera is not None):
+            return
+        if self._running:
+            # Swapping the camera mid-run would change the policy's input distribution
+            # partway through an episode, and the results video with it.
+            self._log("Stop the policy before switching camera.", "warn")
+            self.camera_source_var.set(self._camera_source_label(self._camera_source))
+            return
+        self._open_camera(source)
+        self.camera_source_var.set(self._camera_source_label(self._camera_source))
+
+    def _show_camera_placeholder(self):
+        canvas = camera_source.placeholder_frame(
+            self.image_size, self.camera, self._camera_source,
+            self.args.remote_camera_port, 480,
+        )
+        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
+        self.feed.configure(image=photo)
+        self.feed.image = photo
 
     # -- connection ----------------------------------------------------------
 
@@ -455,6 +547,14 @@ class DeployApp(tk.Tk):
             return
         if self.link is None:
             self._log("Connect to the board before starting.", "warn")
+            return
+        if self.camera is None:
+            self._log("No camera selected -- choose a source from the Camera dropdown.", "warn")
+            return
+        if self.camera.get_latest() is None:
+            # Starting blind would drive the arm from whatever frame arrives first,
+            # or hold at a stop until one does.
+            self._log("No camera frame yet -- wait for the feed before starting.", "warn")
             return
         if not self.task_var.get().strip():
             self._log("Enter the task prompt the policy was trained with.", "warn")
@@ -559,7 +659,7 @@ class DeployApp(tk.Tk):
             self._stop(reason="inference error")
             return
 
-        latest = self.camera.get_latest()
+        latest = self.camera.get_latest() if self.camera is not None else None
         if latest is None:
             return
         rgb = resize_keep_aspect(latest[0], self.image_size)
@@ -613,11 +713,16 @@ class DeployApp(tk.Tk):
 
     def _feed_tick(self):
         self.after(FEED_REFRESH_MS, self._feed_tick)
-        latest = self.camera.get_latest()
+        latest = self.camera.get_latest() if self.camera is not None else None
         if latest is None:
+            self._show_camera_placeholder()
             return
+        self._note_camera_connected()
         rgb = resize_keep_aspect(latest[0], self.image_size)
-        photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((480, 270)))
+        store_h, store_w = self.image_size
+        photo = ImageTk.PhotoImage(
+            Image.fromarray(rgb).resize((480, max(1, int(store_h * (480 / store_w)))))
+        )
         self.feed.configure(image=photo)
         self.feed.image = photo
 

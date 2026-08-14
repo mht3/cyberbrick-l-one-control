@@ -14,7 +14,7 @@ sys.path.append('/bbl')  # leds.py lives here; boot.py only adds /app for us
 
 from control import MotorsControllerExecMapper, ServosControllerExecMapper
 from leds import LEDController
-from wifi_secrets import AP_PASSWORD, AP_SSID, STA_PASSWORD, STA_SSID
+from wifi_secrets import AP_PASSWORD, AP_SSID, STA_HOSTNAME, STA_PASSWORD, STA_SSID
 
 PORT = 8266
 WIFI_MODE_FLAG = '/wifi_mode.flag'  # must match boot.py
@@ -101,11 +101,62 @@ def _disable_power_save(sta):
     return False
 
 
+def _dhcp_label():
+    """The DHCP hostname to claim, derived from STA_HOSTNAME.
+
+    STA_HOSTNAME is what the desktop connects to and may be a fully qualified name
+    (board.dynamic.example.edu); DHCP wants only the first label. If it is an IP
+    address there is no name to register, so return None.
+    """
+    name = (STA_HOSTNAME or '').strip()
+    if not name:
+        return None
+    label = name.split('.')[0]
+    if not label or label.isdigit():  # an IP was configured, not a name
+        return None
+    return label
+
+
+def _set_hostname(sta):
+    """Claim a stable DHCP hostname before requesting a lease.
+
+    Without this the board sends whatever its build defaults to, and a network that
+    registers DHCP clients in DNS (…dynamic.ucsd.edu) publishes *that* name -- which
+    is why the address resolved sometimes and returned NXDOMAIN after a lease lapsed.
+    The IP stays dynamic; the name does not.
+
+    Called before active()/connect(): the hostname rides along in the DHCP request,
+    and the stricter MicroPython versions require it to be set before the interface
+    comes up.
+
+    The API moved between versions, so try each spelling. The catch is deliberately
+    broad -- unknown config keys raise different types across ports, and an
+    unregistered name is worth far less than a board that will not join the network
+    at all. Never let this stop connect_sta().
+    """
+    label = _dhcp_label()
+    if label is None:
+        return
+    for attempt in (
+        lambda: network.hostname(label),            # MicroPython >= 1.20
+        lambda: sta.config(dhcp_hostname=label),    # older esp32 port
+        lambda: sta.config(hostname=label),         # some 1.19-era builds
+    ):
+        try:
+            attempt()
+            print(f"[WIFI] DHCP hostname set to {label}")
+            return
+        except Exception:
+            continue
+    print(f"[WIFI] could not set DHCP hostname ({label}) -- DNS name may be unstable")
+
+
 def connect_sta(timeout=15):
     """Join STA_SSID. Safe to call whether or not the AP is already up --
     ESP32 handles AP+STA concurrently, sharing one radio, and this doesn't
     touch the AP interface either way."""
     sta = network.WLAN(network.STA_IF)
+    _set_hostname(sta)  # before active(): stricter builds latch the name at bring-up
     sta.active(True)
     _disable_power_save(sta)
     if not sta.isconnected():
@@ -116,7 +167,11 @@ def connect_sta(timeout=15):
     if not sta.isconnected():
         raise RuntimeError("STA connect failed/timed out")
     ip = sta.ifconfig()[0]
-    print(f"[WIFI] STA up: ssid={STA_SSID} ip={ip}")
+    label = _dhcp_label()
+    # The IP is whatever DHCP handed out and will change; the hostname is the part
+    # worth typing into the host tools, so print both and say which is stable.
+    print(f"[WIFI] STA up: ssid={STA_SSID} ip={ip}"
+          + (f" hostname={label} (connect to {STA_HOSTNAME})" if label else ""))
     return ip
 
 
