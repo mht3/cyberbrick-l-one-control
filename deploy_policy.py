@@ -241,6 +241,7 @@ class DeployApp(tk.Tk):
         self._shutting_down = False
         self._held = None
         self._held_ticks = 0
+        self._underrun_reported = False
         self._tick_index = 0
         self._writer = None
         self._log_file = None
@@ -468,6 +469,7 @@ class DeployApp(tk.Tk):
         self._tick_index = 0
         self._held = None
         self._held_ticks = 0
+        self._underrun_reported = False
         self._history.clear()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -560,7 +562,11 @@ class DeployApp(tk.Tk):
             # Hold briefly through jitter, then stop rather than drive on stale commands.
             self._held_ticks += 1
             if self._held is None or self._held_ticks > MAX_HELD_TICKS:
-                self._log("Inference underrun -- stopping the arm", "warn")
+                if not self._underrun_reported:
+                    # Once per episode -- a sustained underrun fires every tick and the
+                    # repeats would bury everything else in the log.
+                    self._log("Inference underrun -- stopping the arm", "warn")
+                    self._underrun_reported = True
                 self.bus.cancel_pending()
                 self.bus.send_now("stop_all")
                 self._held = None
@@ -568,6 +574,7 @@ class DeployApp(tk.Tk):
             action = self._held
         else:
             self._held_ticks = 0
+            self._underrun_reported = False
             action = snap_to_levels(raw) if self.mode_action.get() == "snap" else clamp_to_limits(raw)
             self._held = action
 

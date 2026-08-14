@@ -234,3 +234,6 @@ logs/
 # Training checkpoints and local wandb runs (lerobot-train writes outputs/train/<date>/)
 outputs/
 wandb/
+
+# Deployment runs: video, per-tick action log, run metadata
+results/

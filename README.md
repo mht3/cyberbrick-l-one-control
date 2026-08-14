@@ -75,8 +75,9 @@ pytest tests/
 - [`virtual_gripper.py`](virtual_gripper.py) -- host-side GUI for driving the arm directly, either over USB (raw REPL) or over WiFi (via `LOneGripper/wifi_bridge.py`).
 - [`test_motors.py`](test_motors.py) -- step-through hardware test for each configured motor/servo channel; reuses the USB link from `virtual_gripper.py`.
 - [`collect_data.py`](collect_data.py) -- teleop GUI that records demonstrations into a LeRobotDataset.
-- [`lone_data/`](lone_data/) -- dataset schema ([`features.py`](lone_data/features.py)), the LeRobot writer ([`lerobot_recorder.py`](lone_data/lerobot_recorder.py)), camera capture, and the command bus that keeps robot I/O off the record loop.
-- [`scripts/`](scripts/) -- `train.py`, `fix_action_stats.py`, `add_state_column.py`, `inspect_dataset.py`, `validate_dataset.py`, `test_policy_pipeline.py`.
+- [`lone_data/`](lone_data/) -- dataset schema ([`features.py`](lone_data/features.py)), the LeRobot writer ([`lerobot_recorder.py`](lone_data/lerobot_recorder.py)), camera capture, the command bus that keeps robot I/O off the record loop, and action dispatch ([`dispatch.py`](lone_data/dispatch.py)).
+- [`deploy_policy.py`](deploy_policy.py) -- GUI that runs a trained checkpoint on the arm and logs video and actions to `results/`.
+- [`scripts/`](scripts/) -- `train.py`, `eval_policy.py`, `fix_action_stats.py`, `add_state_column.py`, `inspect_dataset.py`, `validate_dataset.py`, `test_policy_pipeline.py`.
 
 Both `LOneGripper/` and `LOneRC/` share a `bbl/` module (buzzer, motors, servos, LEDs, sleep) and an `app/` folder (`control`, `devices`, `parser`, `rc_main`) that build on [CyberBrick's `CyberBrick_Controller_Core`](https://github.com/CyberBrick-Official/CyberBrick_Controller_Core) firmware -- `bbl/` is used as-is from core, while `boot.py`/`rc_main.py` extend core's versions with WiFi-fallback behavior. See [`LICENSE`](LICENSE) -- code derived from core carries CyberBrick's own license terms in addition to this repo's.
 
@@ -304,6 +305,75 @@ into L-ONE's command ranges, so `pi05_base` will emit plausible-looking numbers 
 reinterpret four pretrained position dimensions as PWM and servo speeds, which is arbitrary.
 lerobot's π0.5 port has no text-generation path either, so the hierarchical subtask prediction
 that would be genuinely useful zero-shot is not available through it.
+
+### Evaluating a checkpoint
+
+```sh
+python scripts/eval_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model
+```
+
+Scores a checkpoint against the recorded demonstrations without touching hardware. It loads the
+checkpoint the same way deployment does, so the normalization statistics frozen in at training
+time are the ones used -- never recomputed from the dataset.
+
+**This is teacher-forced open-loop evaluation.** Every prediction is made from a *recorded*
+frame and the policy's own actions are never fed back, so it measures fit to the
+demonstrations, not task success. It cannot see compounding error.
+
+Read the output in this order:
+
+1. **MSE against the predict-the-mean baseline.** A policy at or above baseline has learned
+   nothing from the image. This is the single most useful number. Where a dimension is constant
+   across the sampled frames the baseline is 0 and unbeatable, so the script says so rather than
+   printing a meaningless verdict.
+2. **Prediction spread per dimension**, beside the ground truth's. A std near zero is mode
+   collapse -- the policy emitting one action regardless of input.
+3. **Same-input spread** (`--repeats`, default 8). π0.5 is a flow-matching model that draws
+   fresh noise every call, so repeated predictions on an identical frame genuinely differ --
+   measured at roughly `[240, 27, 15, 13]` per dimension. That variance *is* the policy, not
+   measurement error, and a large MSE next to a large spread means something different from a
+   large MSE alone. ACT reports exactly `0.0000` here, which is the honest contrast.
+
+Per-dimension numbers are in raw command units; the average is normalized by
+`ACTION_COMMAND_LIMITS`, because dim 0 spans ±900 while dim 3 spans 90 and a raw average would
+be almost entirely dim 0. `--json <path>` writes the same figures machine-readably.
+
+### Deployment
+
+```sh
+python deploy_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model
+```
+
+A GUI in the same shape as `collect_data.py`: connect over Serial or WiFi, pick a checkpoint
+folder, confirm the task prompt, and run. The prompt is prefilled by following the checkpoint's
+`train_config.json` to its dataset and reading the task back out of the metadata -- π0.5
+conditions on that text, so a differently worded prompt is a different conditioning.
+
+**Action mode.** The policy emits continuous values, but the demonstrations only ever contained
+three discrete levels per channel. *Snap to demonstrated levels* (default) quantizes back onto
+them, keeping the arm inside the distribution it was trained on; *raw* clamps to
+`ACTION_COMMAND_LIMITS` instead. Both the raw prediction and the dispatched action are logged
+either way, so the choice stays visible after the fact.
+
+**Why inference runs on a worker thread.** π0.5 takes ~280 ms per inference on an RTX 5090,
+which is most of a control period. It runs off the Tk thread and keeps a queue of upcoming
+actions filled; the control tick only pops and dispatches. One inference covers
+`n_action_steps / fps` seconds of motion — 0.40 s at 25 Hz with the default 10 — and the live
+readout shows measured latency against that budget so the margin is visible rather than
+inferred. If the queue empties, the last action is held for up to 3 ticks to ride out jitter and
+then the arm is stopped; it never keeps driving on stale commands.
+
+Every run writes `results/deploy_<timestamp>/` (gitignored):
+
+```
+video.mp4      frames exactly as they were given to the policy
+actions.jsonl  per tick: raw prediction, dispatched action, inference latency, underrun flag
+run.json       checkpoint, task, fps, action mode, device, git SHA
+```
+
+**STOP ALL** and `<space>` stop the arm at any time. A stop also fires on Stop, on window close,
+on link death, and from a `finally` around the main loop, each preceded by `cancel_pending()` so
+a queued speed cannot land after it.
 
 ### Versions
 
