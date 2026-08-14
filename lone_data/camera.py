@@ -27,6 +27,10 @@ class CameraStream:
         self._cap = cv2.VideoCapture(index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Could not open camera index {index}")
+        # Without this, most UVC webcams default to raw YUYV, which at 1280x720 exceeds
+        # USB2 bandwidth and silently caps the driver at ~10fps regardless of the fps
+        # requested below. MJPG uses the camera's onboard hardware compression instead.
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._cap.set(cv2.CAP_PROP_FPS, fps)
