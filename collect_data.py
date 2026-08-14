@@ -52,6 +52,7 @@ from virtual_gripper import (
 )
 
 from lone_data.camera import CameraStream
+from lone_data.camera_stream import CameraStreamReceiver
 from lone_data.command_bus import CommandBus
 from lone_data.features import (
     ACTION_DIM,
@@ -128,6 +129,11 @@ def parse_args():
     p.add_argument("--width", type=int, default=1280, help="requested camera capture width")
     p.add_argument("--height", type=int, default=720, help="requested camera capture height")
     p.add_argument("--camera-fps", type=int, default=30, help="requested camera capture fps")
+    p.add_argument("--remote-camera", action="store_true",
+                   help="receive camera frames over the network (see stream_camera.py) instead of "
+                        "opening a local camera")
+    p.add_argument("--remote-camera-port", type=int, default=8267,
+                   help="port to listen on for --remote-camera")
     p.add_argument("--fps", type=int, default=25, help="dataset recording rate")
     p.add_argument("--repo-id", default="lone/l_one", help="LeRobot dataset repo id")
     p.add_argument("--root", default=None, help="dataset directory (default: data/lerobot/<repo-id>)")
@@ -171,8 +177,11 @@ class CollectDataApp(tk.Tk):
         self.bus.start()
 
         # -- camera -------------------------------------------------------
-        # Opened on the main thread so macOS's camera-permission prompt gets a run loop.
-        self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
+        if args.remote_camera:
+            self.camera = CameraStreamReceiver(port=args.remote_camera_port)
+        else:
+            # Opened on the main thread so macOS's camera-permission prompt gets a run loop.
+            self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
         self.camera.start()
 
         # -- dataset --------------------------------------------------------

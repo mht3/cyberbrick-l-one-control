@@ -53,6 +53,7 @@ from virtual_gripper import (
 )
 
 from lone_data.camera import CameraStream
+from lone_data.camera_stream import CameraStreamReceiver
 from lone_data.command_bus import CommandBus
 from lone_data.dispatch import clamp_to_limits, dispatch_action, snap_to_levels
 from lone_data.features import ACTION_DIM, ACTION_NAMES, DEFAULT_IMAGE_SIZE, resize_keep_aspect
@@ -73,6 +74,11 @@ def parse_args():
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--camera-fps", type=int, default=30)
+    p.add_argument("--remote-camera", action="store_true",
+                   help="receive camera frames over the network (see stream_camera.py) instead of "
+                        "opening a local camera")
+    p.add_argument("--remote-camera-port", type=int, default=8267,
+                   help="port to listen on for --remote-camera")
     p.add_argument("--fps", type=int, default=25, help="control rate")
     p.add_argument("--checkpoint", default=None, help="pretrained_model/ dir to preload")
     p.add_argument("--task", default="", help="task prompt (defaults to the checkpoint's)")
@@ -258,7 +264,10 @@ class DeployApp(tk.Tk):
         )
         self.bus.start()
 
-        self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
+        if args.remote_camera:
+            self.camera = CameraStreamReceiver(port=args.remote_camera_port)
+        else:
+            self.camera = CameraStream(args.camera_index, args.width, args.height, args.camera_fps)
         self.camera.start()
 
         self._build_ui()
