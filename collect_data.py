@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
@@ -63,7 +63,7 @@ from lone_data.features import (
 )
 from lone_data.lerobot_recorder import LoneRecorder, has_saved_episodes
 from lone_data.playback import EpisodeVideo
-from lone_data.task_edit import set_episode_task
+from lone_data.dataset_edit import delete_episode, set_episode_task
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -516,6 +516,12 @@ class CollectDataApp(RobotAppBase):
         )
         self.review_task_save_btn.pack(side="left")
 
+        self.review_delete_btn = ttk.Button(
+            self.review_active_frame, text="Delete episode", style="Danger.TButton",
+            command=self._delete_review_episode,
+        )
+        self.review_delete_btn.pack(anchor="w", pady=(6, 0))
+
         self._set_review_buttons_state()
 
     def _set_review_buttons_state(self):
@@ -526,6 +532,7 @@ class CollectDataApp(RobotAppBase):
         self.review_exit_btn.config(state=state)
         self.review_task_entry.config(state="normal" if self._review_mode else "disabled")
         self.review_task_save_btn.config(state=state)
+        self.review_delete_btn.config(state=state)
         self.review_play_btn.config(state=state)
         self.review_slider.config(state=state)
 
@@ -602,6 +609,55 @@ class CollectDataApp(RobotAppBase):
             self._exit_review_mode()
             return
         self._load_review_episode(episode_idx)
+
+    def _delete_review_episode(self):
+        """Remove the episode being reviewed, after confirming.
+
+        Unlike a task edit this rebuilds the dataset -- every later episode is
+        renumbered and any video file mixing kept and deleted episodes is
+        re-encoded -- so it can take a while and is worth asking about first. The
+        previous dataset is kept alongside as <root>_old.
+        """
+        if not self._review_mode or self._review_episode_idx is None:
+            return
+        episode_idx = self._review_episode_idx
+        total = self._n_episodes
+        if total <= 1:
+            self._log("Cannot delete the only episode -- delete the dataset directory instead.",
+                      level="warn")
+            return
+        if not messagebox.askyesno(
+            "Delete episode",
+            f"Delete episode {episode_idx:06d} of {total}?\n\n"
+            "The dataset is rebuilt and later episodes are renumbered. "
+            "The current version is kept alongside as _old.",
+            parent=self,
+        ):
+            return
+
+        self._close_review_video()
+        self._log(f"Deleting episode {episode_idx:06d} -- rebuilding the dataset...", level="warn")
+        self.update_idletasks()
+        try:
+            if self.recorder is not None:
+                self.recorder.close()
+                self.recorder = None
+            remaining, backup = delete_episode(
+                self.dataset_root, self.args.repo_id, episode_idx
+            )
+        except Exception as e:
+            self._log(f"Could not delete episode: {e}", level="error")
+            self._exit_review_mode()
+            return
+
+        self._log(f"Deleted episode {episode_idx:06d} -- {remaining} left "
+                  f"(previous dataset kept at {os.path.basename(backup)})", level="connected")
+        if not self._ensure_recorder():
+            self._exit_review_mode()
+            return
+        # Whatever now occupies this slot, or the last episode if we removed the end.
+        self._load_review_episode(min(episode_idx, remaining - 1))
+        self._set_episode_buttons_state()
 
     def _exit_review_mode(self):
         if not self._review_mode:
