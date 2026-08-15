@@ -1,86 +1,93 @@
 #!/usr/bin/env python3
-"""Deployment GUI: run a trained checkpoint on the CyberBrick L-ONE arm.
+"""Deployment GUI: drive the CyberBrick L-ONE arm from a trained checkpoint.
 
-Connects over serial or WiFi exactly like collect_data.py, loads a checkpoint
-folder, and drives the arm from camera frames at a fixed rate while logging
-everything to results/.
+A peer of collect_data.py -- same connection bar, same joint controls and
+keybindings, same camera dropdown -- with a policy mode on top.
 
-Three things shape the control loop:
+The working shape of a deployment is: connect, teleoperate the arm to a sensible
+starting position, check the task prompt, hand control to the policy, watch what
+it commands, and take control back. So manual control is the default and always
+the fallback; the policy is something you switch into and out of.
 
-Inference is slow relative to the control rate. pi0.5 takes ~280ms on an RTX 5090,
-which is most of a control period, so it runs on a worker thread that keeps a queue
-of upcoming actions filled. The Tk tick only pops and dispatches. This is the same
-reason CommandBus exists -- anything that blocks the main thread stalls control.
+    python deploy_policy.py --checkpoint outputs/train/.../checkpoints/last/pretrained_model
 
-The policy predicts a chunk. n_action_steps actions come back per inference and are
-executed in order, so one inference covers n_action_steps/fps seconds of motion.
+The checkpoint is a command-line argument only. Choosing a policy is not something
+to do by accident mid-session with an arm powered up.
+
+Two details shape the control loop:
+
+Inference is slow relative to the control rate -- pi0.5 takes ~280ms on an RTX
+5090, most of a control period -- so it runs on a worker thread that keeps a queue
+of upcoming actions filled, and the Tk tick only pops and dispatches. Same reason
+CommandBus exists: anything blocking the main thread stalls control.
 
 The policy emits continuous values, but the demonstrations only ever contained
 three discrete levels per channel. "Snap" quantizes back onto them (default, and
-closest to what the arm was actually driven at); "raw" clamps to the command limits
-instead. Both are logged either way, so the choice is visible after the fact.
+closest to how the arm was actually driven); "raw" clamps to the command limits.
+Both are logged either way, so the choice stays visible after the fact.
 """
 
 import argparse
 import datetime
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
 import tkinter as tk
 from collections import deque
-from tkinter import filedialog, ttk
+from tkinter import ttk
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
 from virtual_gripper import (
-    AP_FIXED_IP,
     BASE_MOTOR,
     GRIPPER_SERVO,
     LOWER_ARM_SERVO,
     PALETTE,
-    STA_HOSTNAME,
     UPPER_ARM_SERVO,
-    WIFI_PORT,
-    CyberBrickLink,
-    CyberBrickWifiLink,
     LinkDesynced,
-    find_default_port,
-    list_usb_ports,
 )
 
 from lone_data import camera_source
 from lone_data.command_bus import CommandBus
 from lone_data.dispatch import clamp_to_limits, dispatch_action, snap_to_levels
-from lone_data.features import ACTION_DIM, ACTION_NAMES, DEFAULT_IMAGE_SIZE, resize_keep_aspect
+from lone_data.features import (
+    ACTION_COMMAND_LIMITS,
+    ACTION_DIM,
+    ACTION_NAMES,
+    DEFAULT_IMAGE_SIZE,
+    resize_keep_aspect,
+)
+from lone_data.robot_gui import RobotAppBase, WIFI_HEARTBEAT_MS
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 CHANNELS = (BASE_MOTOR, UPPER_ARM_SERVO, LOWER_ARM_SERVO, GRIPPER_SERVO)
 
-WIFI_HEARTBEAT_MS = 200   # under wifi_bridge.py's COMMAND_DEADMAN_TIMEOUT
-PLOT_REFRESH_MS = 100     # ~10Hz, deliberately slower than the control tick
-FEED_REFRESH_MS = 50
-PLOT_WINDOW = 150         # ticks kept on screen
-MAX_HELD_TICKS = 3        # ticks to reuse the last action before stopping
+DISPLAY_MAX_WIDTH = 640
+FEED_REFRESH_MS = 50    # ~20Hz preview, deliberately below the control rate
+PLOT_REFRESH_MS = 100   # ~10Hz, slower still so drawing never competes with control
+PLOT_WINDOW = 200       # ticks kept on screen
+MAX_HELD_TICKS = 3      # ticks to reuse the last action before stopping
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--checkpoint", default=None,
+                   help="a checkpoint's pretrained_model/ directory (required to run a policy)")
+    p.add_argument("--task", default="", help="task prompt (defaults to the checkpoint's)")
     p.add_argument("--camera-index", type=int, default=0)
+    p.add_argument("--list-cameras", action="store_true", help="probe camera indices and exit")
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--camera-fps", type=int, default=30)
     p.add_argument("--remote-camera", action="store_true",
-                   help="receive camera frames over the network (see stream_camera.py) instead of "
-                        "opening a local camera")
-    p.add_argument("--remote-camera-port", type=int, default=8267,
-                   help="port to listen on for --remote-camera")
+                   help="receive camera frames over the network (see stream_camera.py)")
+    p.add_argument("--remote-camera-port", type=int, default=8267)
     p.add_argument("--fps", type=int, default=25, help="control rate")
-    p.add_argument("--checkpoint", default=None, help="pretrained_model/ dir to preload")
-    p.add_argument("--task", default="", help="task prompt (defaults to the checkpoint's)")
     p.add_argument("--n-action-steps", type=int, default=None,
                    help="override how many actions are executed per inference")
     p.add_argument("--device", default=None)
@@ -92,23 +99,22 @@ def parse_args():
 def git_sha():
     try:
         return subprocess.check_output(
-            ["git", "-C", REPO_DIR, "rev-parse", "--short", "HEAD"], text=True,
-            stderr=subprocess.DEVNULL,
+            ["git", "-C", REPO_DIR, "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
         return None
 
 
 def checkpoint_task(checkpoint):
-    """The task string the checkpoint was trained on, so deployment matches training.
+    """The task string the checkpoint trained on, so deployment matches training.
 
     pi0.5 conditions on this text, so a differently worded prompt is a different
-    conditioning. It is not stored in the checkpoint -- train_config.json only records
-    which dataset was used -- so follow that pointer and read the task back out of the
-    dataset's metadata. Returns "" if the dataset is not on this machine, in which case
-    the operator types it.
+    conditioning. It is not stored in the checkpoint -- train_config.json records only
+    which dataset was used -- so follow that pointer and read the task out of the
+    dataset's metadata. Returns "" if the dataset is not on this machine.
     """
-    path = os.path.join(checkpoint, "train_config.json")
+    path = os.path.join(checkpoint or "", "train_config.json")
     if not os.path.exists(path):
         return ""
     try:
@@ -116,7 +122,6 @@ def checkpoint_task(checkpoint):
             dataset = json.load(f).get("dataset", {})
     except (OSError, json.JSONDecodeError):
         return ""
-
     root, repo_id = dataset.get("root"), dataset.get("repo_id")
     if not root or not repo_id:
         return ""
@@ -132,11 +137,23 @@ def checkpoint_task(checkpoint):
     return tasks[0] if len(tasks) == 1 else ""
 
 
+def validate_checkpoint(path):
+    """Reason `path` is not a usable checkpoint directory, or None."""
+    if not path:
+        return "No --checkpoint given; manual control only."
+    if not os.path.isdir(path):
+        return f"{path} is not a directory."
+    for name in ("config.json", "model.safetensors"):
+        if not os.path.exists(os.path.join(path, name)):
+            return f"{path} has no {name} -- point at a checkpoint's pretrained_model/ folder."
+    return None
+
+
 class PolicyRunner:
     """Loads a checkpoint and serves action chunks from a worker thread.
 
     Inference is far too slow to run inline with a 25-30Hz control tick, so the
-    thread refills a queue and the caller only ever pops.
+    thread keeps a queue filled and the caller only ever pops.
     """
 
     def __init__(self, checkpoint, task, device=None, n_action_steps=None):
@@ -155,15 +172,12 @@ class PolicyRunner:
         self.policy_type = cfg.type
         self.policy = get_policy_class(cfg.type).from_pretrained(checkpoint)
         self.policy.eval().to(self.device)
-        self.pre, self.post = make_pre_post_processors(
-            policy_cfg=cfg, pretrained_path=checkpoint
-        )
+        self.pre, self.post = make_pre_post_processors(policy_cfg=cfg, pretrained_path=checkpoint)
         self.n_action_steps = int(n_action_steps or getattr(cfg, "n_action_steps", 1) or 1)
 
         self._pending = deque()
         self._lock = threading.Lock()
         self._frame = None
-        self._busy = False
         self._running = False
         self._thread = None
         self.last_latency = None
@@ -181,7 +195,6 @@ class PolicyRunner:
             self._thread = None
 
     def submit_frame(self, rgb):
-        """Hand the newest frame to the worker. Cheap; called every tick."""
         with self._lock:
             self._frame = rgb
 
@@ -213,10 +226,9 @@ class PolicyRunner:
                 continue
             try:
                 started = time.perf_counter()
-                observation = self._observation(frame)
                 batch = {
                     k: (v.unsqueeze(0) if self.torch.is_tensor(v) else [v])
-                    for k, v in observation.items()
+                    for k, v in self._observation(frame).items()
                 }
                 with self.torch.no_grad():
                     chunk = self.policy.predict_action_chunk(self.pre(batch))
@@ -232,29 +244,26 @@ class PolicyRunner:
                 return
 
 
-class DeployApp(tk.Tk):
+class DeployApp(RobotAppBase):
     def __init__(self, args):
         super().__init__()
         self.args = args
         self.title("CyberBrick L-ONE Policy Deployment")
         self.configure(background=PALETTE["bg"])
-        self.minsize(1100, 760)
+        self.minsize(1100, 720)
+        self._setup_style()
 
+        # -- robot link state --------------------------------------------
         self.link = None
-        self.runner = None
-        self._running = False
+        self.ap_ip = None
+        self.wifi_kind = None
+        self.gripper_open = True
+        self._pressed_keys = set()
+        self._key_release_after = {}
+        self._wifi_connect_generation = 0
         self._shutting_down = False
-        self._held = None
-        self._held_ticks = 0
-        self._underrun_reported = False
-        self._tick_index = 0
-        self._writer = None
-        self._log_file = None
-        self._result_dir = None
-        self._period = 1.0 / args.fps
-        self._next_deadline = None
-        self._history = deque(maxlen=PLOT_WINDOW)
-        self.image_size = (args.image_height, args.image_width)
+        self._link_up_mono = None
+        self._failed_reconnects = 0
 
         self.bus = CommandBus(
             on_error=lambda m: self.after(0, self._log, f"Command failed: {m}", "error"),
@@ -263,87 +272,57 @@ class DeployApp(tk.Tk):
         )
         self.bus.start()
 
-        # Selected from the toolbar and swappable at runtime, so a machine with no
-        # local camera still opens -- pick the remote source and carry on.
+        # -- camera -------------------------------------------------------
         self.camera = None
+        # Remote is only offered when the app was launched to receive a stream:
+        # on a machine nothing streams to, it is a dead menu entry.
         self._camera_source = camera_source.pick_initial_source(
-            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index
+            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index,
+            include_remote=args.remote_camera,
         )
         self._camera_connected = False
+        self.image_size = (args.image_height, args.image_width)
 
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._shutdown)
-        self.bind("<space>", lambda e: self._stop_all())
-        self.bind("q", lambda e: self._shutdown())
+        # -- action state --------------------------------------------------
+        # _current_action is the single record of what was last commanded, whoever
+        # commanded it. The plots and the recorder read only this, so they behave
+        # identically in manual and policy mode and cannot disagree about what the
+        # arm was told to do.
+        self._current_action = np.zeros(ACTION_DIM, dtype=np.float32)
+        self._history = deque(maxlen=PLOT_WINDOW)
+        self._period = 1.0 / args.fps
+        self._feed_ticks = 0
 
-        # After _build_ui so a camera that will not open reports itself in the GUI
-        # rather than taking the process down before there is a GUI.
-        if not self._open_camera(self._camera_source):
-            self._log("Pick another source from the Camera dropdown, or run "
-                      "stream_camera.py elsewhere and choose Remote.", "warn")
+        # -- policy state --------------------------------------------------
+        self.runner = None
+        self._policy_running = False
+        self._next_deadline = None
+        self._held = None
+        self._held_ticks = 0
+        self._underrun_reported = False
+        self._tick_index = 0
+        self._last_raw = None
 
-        if args.checkpoint:
-            self._set_checkpoint(args.checkpoint)
+        # -- recording state (results/ only; never a LeRobotDataset) --------
+        self._recording = False
+        self._writer = None
+        self._log_file = None
+        self._result_dir = None
 
-        self._wifi_heartbeat_tick()
-        self._plot_tick()
+        # -- UI ---------------------------------------------------------
+        self._build_log_panel(self)
+        self._build_plot_panel(self)
 
-    # -- UI -----------------------------------------------------------------
+        main_row = ttk.Frame(self)
+        main_row.pack(fill="both", expand=True)
 
-    def _build_ui(self):
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
+        camera_frame = ttk.Frame(main_row, padding=(16, 16, 8, 16))
+        camera_frame.pack(side="left", fill="both", expand=True)
 
-        bar = ttk.Frame(root)
-        bar.pack(fill="x", pady=(0, 10))
-        self.mode_var = tk.StringVar(value="")
-        ttk.Radiobutton(bar, text="Serial", variable=self.mode_var, value="serial",
-                        command=self._on_mode).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(bar, text="WiFi", variable=self.mode_var, value="wifi",
-                        command=self._on_mode).grid(row=0, column=1, sticky="w", padx=(10, 0))
-        self.port_var = tk.StringVar(value=find_default_port())
-        self.port_combo = ttk.Combobox(bar, textvariable=self.port_var, width=22,
-                                       values=list_usb_ports(),
-                                       postcommand=lambda: self.port_combo.config(values=list_usb_ports()))
-        self.port_combo.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.host_var = tk.StringVar(value=STA_HOSTNAME)
-        self.host_entry = ttk.Entry(bar, textvariable=self.host_var, width=26)
-        self.host_entry.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
-        self.ap_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="AP Mode", variable=self.ap_var,
-                        command=self._on_ap_toggle).grid(row=1, column=3, padx=(10, 0), pady=(6, 0))
-        ttk.Button(bar, text="Connect", command=self._connect).grid(row=1, column=4, padx=(10, 0), pady=(6, 0))
-        ttk.Button(bar, text="STOP ALL (space)", command=self._stop_all).grid(row=0, column=5, sticky="e", padx=(10, 0))
-        ttk.Button(bar, text="Quit (Q)", command=self._shutdown).grid(row=0, column=4, sticky="e", padx=(10, 0))
-        self._update_transport()
+        video_group = ttk.Frame(camera_frame)
+        video_group.pack(anchor="n")
 
-        setup = ttk.LabelFrame(root, text="Policy", padding=10)
-        setup.pack(fill="x", pady=(0, 10))
-        self.ck_var = tk.StringVar(value=self.args.checkpoint or "")
-        ttk.Entry(setup, textvariable=self.ck_var, width=70).grid(row=0, column=0, sticky="we")
-        ttk.Button(setup, text="Browse...", command=self._browse).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(setup, text="Task").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.task_var = tk.StringVar(value=self.args.task)
-        ttk.Entry(setup, textvariable=self.task_var, width=70).grid(row=2, column=0, sticky="we")
-        self.mode_action = tk.StringVar(value="snap")
-        modes = ttk.Frame(setup)
-        modes.grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(modes, text="Snap to demonstrated levels", variable=self.mode_action,
-                        value="snap").pack(side="left")
-        ttk.Radiobutton(modes, text="Raw (clamped)", variable=self.mode_action,
-                        value="raw").pack(side="left", padx=(12, 0))
-        self.start_btn = ttk.Button(setup, text="Start", command=self._start)
-        self.start_btn.grid(row=3, column=1, sticky="e", pady=(8, 0))
-        self.stop_btn = ttk.Button(setup, text="Stop", command=self._stop, state="disabled")
-        self.stop_btn.grid(row=3, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
-        setup.columnconfigure(0, weight=1)
-
-        body = ttk.Frame(root)
-        body.pack(fill="both", expand=True)
-
-        feed_group = ttk.Frame(body)
-        feed_group.pack(side="left", padx=(0, 10), anchor="n")
-        source_row = ttk.Frame(feed_group)
+        source_row = ttk.Frame(video_group)
         source_row.pack(fill="x", pady=(0, 6))
         ttk.Label(source_row, text="Camera").pack(side="left")
         self.camera_source_var = tk.StringVar(value=self._camera_source_label(self._camera_source))
@@ -354,309 +333,224 @@ class DeployApp(tk.Tk):
         self.camera_combo.pack(side="left", padx=(8, 0))
         self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_source)
 
-        self.feed = ttk.Label(feed_group)
-        self.feed.pack()
-        self._build_plot(body)
+        self.camera_label = ttk.Label(video_group)
+        self.camera_label.pack()
 
-        self.status_var = tk.StringVar(value="Idle.")
-        ttk.Label(root, textvariable=self.status_var).pack(fill="x", pady=(8, 0))
-        self.log = tk.Text(root, height=8, background=PALETTE["log_bg"], foreground=PALETTE["log_fg"])
-        self.log.pack(fill="both", expand=False, pady=(8, 0))
+        right = ttk.Frame(main_row, padding=(8, 16, 16, 16))
+        right.pack(side="left", fill="y")
 
-        self._feed_tick()
+        self._build_connection_bar(right)
+        self.joint_controls_frame = self._build_controls(right)
+        self._build_policy_controls(right)
 
-    def _build_plot(self, parent):
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.figure import Figure
+        self._setup_keybindings()
+        self.bind_all("<Button-1>", self._maybe_reclaim_focus, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._shutdown)
+        signal.signal(signal.SIGINT, lambda signum, frame: self._shutdown())
+        self._signal_pump()
 
-        self.figure = Figure(figsize=(6, 4), dpi=90)
-        self.axes = self.figure.add_subplot(111)
-        self.axes.set_title("Dispatched action")
-        self.axes.set_xlabel("tick")
-        self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
-        self.canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
+        self.mode_var.set("wifi")
+        self._on_mode_select()
+        self._set_policy_buttons_state()
+        self._update_status_label()
+        self.focus_set()
 
-    def _log(self, message, level="info"):
-        stamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log.insert("end", f"[{stamp}] {message}\n")
-        self.log.see("end")
-
-    # -- camera source -------------------------------------------------------
-
-    def _camera_source_label(self, source):
-        return camera_source.source_label(source, self.args.remote_camera_port)
-
-    def _refresh_camera_sources(self):
-        sources = camera_source.available_sources(self._camera_source, self.camera is not None)
-        values = [self._camera_source_label(s) for s in sources]
-        current = self._camera_source_label(self._camera_source)
-        if current not in values:
-            values.insert(0, current)
-        self.camera_combo["values"] = values
-
-    def _open_camera(self, source):
-        """Swap to `source`, returning True on success. Never raises -- a camera that
-        will not open must leave the app usable so another source can be chosen."""
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            self.camera = None
-        try:
-            self.camera = camera_source.open_source(
-                source, self.args.remote_camera_port,
-                self.args.width, self.args.height, self.args.camera_fps,
-            )
-        except Exception as e:
-            self._log(f"{self._camera_source_label(source)}: {e}", "error")
-            return False
-        self._camera_source = source
-        # Cleared so the next frame announces itself -- for the remote receiver,
-        # binding the port says nothing about a sender being there.
-        self._camera_connected = False
-        if source == camera_source.REMOTE_SOURCE:
-            self._log(f"Waiting for a sender on port {self.args.remote_camera_port} "
-                      "(run stream_camera.py on the machine with the camera)")
-        else:
-            self._log(f"Opened {self._camera_source_label(source)}")
-        return True
-
-    def _note_camera_connected(self):
-        """Log the first frame from the current source, once."""
-        if self._camera_connected or self.camera is None:
-            return
-        self._camera_connected = True
-        w, h = self.camera.actual_width, self.camera.actual_height
-        self._log(f"Receiving frames from {self._camera_source_label(self._camera_source)} ({w}x{h})")
-
-    def _on_camera_source(self, event=None):
-        source = camera_source.parse_label(self.camera_source_var.get())
-        if source is None or (source == self._camera_source and self.camera is not None):
-            return
-        if self._running:
-            # Swapping the camera mid-run would change the policy's input distribution
-            # partway through an episode, and the results video with it.
-            self._log("Stop the policy before switching camera.", "warn")
-            self.camera_source_var.set(self._camera_source_label(self._camera_source))
-            return
-        self._open_camera(source)
-        self.camera_source_var.set(self._camera_source_label(self._camera_source))
-
-    def _show_camera_placeholder(self):
-        canvas = camera_source.placeholder_frame(
-            self.image_size, self.camera, self._camera_source,
-            self.args.remote_camera_port, 480,
-        )
-        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
-        self.feed.configure(image=photo)
-        self.feed.image = photo
-
-    # -- connection ----------------------------------------------------------
-
-    def _on_mode(self):
-        self._update_transport()
-        if self.mode_var.get() == "serial":
-            self._connect()
-
-    def _on_ap_toggle(self):
-        self.host_var.set(AP_FIXED_IP if self.ap_var.get() else STA_HOSTNAME)
-
-    def _update_transport(self):
-        wifi = self.mode_var.get() == "wifi"
-        self.host_entry.configure(state="normal" if wifi else "disabled")
-        self.port_combo.configure(state="disabled" if wifi else "normal")
-
-    def _connect(self):
-        mode = self.mode_var.get()
-        if not mode:
-            self._log("Choose Serial or WiFi first.", "warn")
-            return
-        self._drop_link()
-        try:
-            if mode == "serial":
-                port = self.port_var.get()
-                if not port:
-                    self._log("Select the board's USB port.", "warn")
-                    return
-                self.link = CyberBrickLink(port)
-                self._log(f"Connected via Serial ({port})")
-            else:
-                host = self.host_var.get().strip()
-                if not host:
-                    self._log("Enter the board's IP address or hostname.", "warn")
-                    return
-                self.link = CyberBrickWifiLink(host, WIFI_PORT)
-                self._log(f"Connected via WiFi ({host}:{WIFI_PORT})")
-            self.bus.set_link(self.link)
-        except Exception as e:
-            self._log(f"Connection failed: {e}", "error")
-            self.link = None
-
-    def _drop_link(self):
-        if self.link is None:
-            return
-        link, self.link = self.link, None
-        self.bus.set_link(None)
-        try:
-            link.close()
-        except Exception:
-            pass
-
-    def _on_link_dead(self, message):
-        self._log(f"Link lost: {message}", "error")
-        if self._running:
-            self._stop(reason="link lost")
-        self._drop_link()
-
-    def _wifi_heartbeat_tick(self):
-        self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
-        # Held speeds must be re-sent or wifi_bridge.py's deadman fires mid-motion.
-        if self._running and isinstance(self.link, CyberBrickWifiLink) and self._held is not None:
-            dispatch_action(self.bus, self._held, CHANNELS)
-
-    # -- policy --------------------------------------------------------------
-
-    def _browse(self):
-        path = filedialog.askdirectory(title="Select a checkpoint's pretrained_model folder")
-        if path:
-            self._set_checkpoint(path)
-
-    def _set_checkpoint(self, path):
-        self.ck_var.set(path)
-        if not self.task_var.get():
-            task = checkpoint_task(path)
-            if task:
-                self.task_var.set(task)
-                self._log(f"Task from checkpoint: {task}")
-
-    def _validate_checkpoint(self, path):
-        if not path or not os.path.isdir(path):
-            return "Select a checkpoint folder."
-        for name in ("config.json", "model.safetensors"):
-            if not os.path.exists(os.path.join(path, name)):
-                return f"{path} has no {name} -- point at a checkpoint's pretrained_model/ folder."
-        return None
-
-    def _start(self):
-        if self._running:
-            return
-        problem = self._validate_checkpoint(self.ck_var.get())
+        problem = validate_checkpoint(args.checkpoint)
         if problem:
-            self._log(problem, "warn")
+            self._log(problem, level="warn")
+        else:
+            self._log(f"Checkpoint: {args.checkpoint}")
+
+        if not self._open_camera(self._camera_source):
+            self._log("Pick another source from the Camera dropdown, or run "
+                      "stream_camera.py elsewhere and choose Remote.", level="warn")
+
+        self.after(0, self._update_camera_feed)
+        self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
+        self.after(PLOT_REFRESH_MS, self._plot_tick)
+
+    # -- RobotAppBase hooks ------------------------------------------------
+
+    def _controls_enabled(self):
+        """Manual input is ignored while the policy drives -- the buttons are
+        visibly disabled, and a keypress landing mid-rollout would fight it."""
+        return not self._policy_running
+
+    def _controls_busy(self):
+        return "Stop the policy" if self._policy_running else None
+
+    def _mode_status_text(self):
+        return "Mode: Policy" if self._policy_running else "Mode: Manual"
+
+    def _on_link_state_changed(self):
+        self._set_policy_buttons_state()
+
+    def _on_link_lost(self):
+        if self._policy_running:
+            self._log("Link lost while the policy was running -- returning to manual", level="warn")
+            self._stop_policy(reason="link lost")
+
+    def _on_emergency_stop(self):
+        if self._policy_running:
+            self._stop_policy(reason="STOP ALL pressed")
+
+    def _on_action_changed(self):
+        """Manual control just moved a joint: record it like a policy action would be."""
+        if not self._policy_running:
+            self._note_action(raw=None, dispatched=self._current_action, underrun=False)
+
+    # -- policy controls ---------------------------------------------------
+
+    def _build_policy_controls(self, parent):
+        frame = ttk.Frame(parent, padding=(0, 8, 0, 0))
+        frame.pack(fill="x")
+
+        ttk.Label(frame, text="Policy", style="SectionHeading.TLabel").pack(anchor="w", pady=(0, 4))
+
+        task_row = ttk.Frame(frame)
+        task_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(task_row, text="Task", width=12, style="JointName.TLabel").pack(side="left")
+        self.task_var = tk.StringVar(value=self.args.task or checkpoint_task(self.args.checkpoint))
+        self.task_entry = ttk.Entry(task_row, textvariable=self.task_var, width=30)
+        self.task_entry.pack(side="left", fill="x", expand=True)
+
+        # The policy emits continuous values; the demonstrations only ever contained
+        # three levels per channel, so snapping keeps the arm inside the distribution
+        # it was trained on. Raw is there to see what the policy actually meant.
+        self._snap_var = tk.BooleanVar(value=True)
+        mode_row = ttk.Frame(frame)
+        mode_row.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(mode_row, text="Snap to levels", variable=self._snap_var,
+                        value=True).pack(side="left")
+        ttk.Radiobutton(mode_row, text="Raw (clamped)", variable=self._snap_var,
+                        value=False).pack(side="left", padx=(10, 0))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x")
+        self.start_policy_btn = ttk.Button(
+            btn_row, text="Start Policy", style="Accent.TButton", command=self._start_policy, width=14
+        )
+        self.start_policy_btn.pack(side="left")
+        self.stop_policy_btn = ttk.Button(
+            btn_row, text="Stop Policy", command=lambda: self._stop_policy(), width=13
+        )
+        self.stop_policy_btn.pack(side="left", padx=(6, 0))
+        self.record_btn = ttk.Button(btn_row, text="Record", command=self._toggle_record, width=10)
+        self.record_btn.pack(side="left", padx=(6, 0))
+
+        self.policy_status_var = tk.StringVar(value="Manual control.")
+        ttk.Label(frame, textvariable=self.policy_status_var, style="Status.TLabel").pack(
+            anchor="w", pady=(8, 0)
+        )
+        self.policy_detail_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.policy_detail_var, style="Status.TLabel").pack(anchor="w")
+        return frame
+
+    def _set_policy_buttons_state(self):
+        can_start = (
+            not self._policy_running
+            and self.link is not None
+            and validate_checkpoint(self.args.checkpoint) is None
+        )
+        self.start_policy_btn.state(["!disabled"] if can_start else ["disabled"])
+        self.stop_policy_btn.state(["!disabled"] if self._policy_running else ["disabled"])
+        for child in self.joint_controls_frame.winfo_children():
+            for widget in child.winfo_children():
+                if isinstance(widget, ttk.Button):
+                    widget.state(["disabled"] if self._policy_running else ["!disabled"])
+        self.record_btn.configure(text="Stop Record" if self._recording else "Record")
+        self.app_mode_status_var.set(self._mode_status_text())
+
+    def _update_status_label(self):
+        if self._policy_running and self.runner is not None:
+            latency = self.runner.last_latency
+            budget = self.runner.n_action_steps * self._period
+            detail = f"queued {self.runner.queued}"
+            if latency:
+                detail += f"  ·  inference {latency * 1000:.0f}ms / {budget * 1000:.0f}ms budget"
+            self.policy_status_var.set(f"Policy running -- tick {self._tick_index}")
+            self.policy_detail_var.set(detail)
+        else:
+            self.policy_status_var.set(
+                "Recording (manual control)." if self._recording else "Manual control."
+            )
+            self.policy_detail_var.set(
+                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
+            )
+
+    # -- policy lifecycle --------------------------------------------------
+
+    def _start_policy(self):
+        if self._policy_running:
+            return
+        problem = validate_checkpoint(self.args.checkpoint)
+        if problem:
+            self._log(problem, level="warn")
             return
         if self.link is None:
-            self._log("Connect to the board before starting.", "warn")
+            self._log("Connect to the board before starting the policy.", level="warn")
             return
-        if self.camera is None:
-            self._log("No camera selected -- choose a source from the Camera dropdown.", "warn")
+        if self.camera is None or self.camera.get_latest() is None:
+            # Starting blind would drive the arm from whatever frame arrives first.
+            self._log("No camera frame yet -- wait for the feed before starting.", level="warn")
             return
-        if self.camera.get_latest() is None:
-            # Starting blind would drive the arm from whatever frame arrives first,
-            # or hold at a stop until one does.
-            self._log("No camera frame yet -- wait for the feed before starting.", "warn")
-            return
-        if not self.task_var.get().strip():
-            self._log("Enter the task prompt the policy was trained with.", "warn")
+        task = self.task_var.get().strip()
+        if not task:
+            self._log("Enter the task prompt the policy was trained with.", level="warn")
+            self.task_entry.focus_set()
             return
 
         self._log("Loading checkpoint...")
         self.update_idletasks()
         try:
             self.runner = PolicyRunner(
-                self.ck_var.get(), self.task_var.get().strip(),
+                self.args.checkpoint, task,
                 device=self.args.device, n_action_steps=self.args.n_action_steps,
             )
         except Exception as e:
-            self._log(f"Could not load checkpoint: {e}", "error")
+            self._log(f"Could not load checkpoint: {e}", level="error")
             self.runner = None
             return
 
-        self._open_results()
         self.runner.start()
-        self._running = True
-        self._tick_index = 0
+        self._policy_running = True
         self._held = None
         self._held_ticks = 0
         self._underrun_reported = False
-        self._history.clear()
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self._log(f"Running {self.runner.policy_type} on {self.runner.device}, "
-                  f"{self.runner.n_action_steps} actions per inference")
+        self._tick_index = 0
+        self._set_policy_buttons_state()
+        self._log(f"Policy running: {self.runner.policy_type} on {self.runner.device}, "
+                  f"{self.runner.n_action_steps} actions per inference", level="connected")
         self._next_deadline = time.monotonic()
         self._control_tick()
 
-    def _stop(self, reason="stopped"):
-        if not self._running:
+    def _stop_policy(self, reason="stopped"):
+        if not self._policy_running:
             return
-        self._running = False
+        self._policy_running = False
         try:
             self.bus.cancel_pending()
             self.bus.send_now("stop_all")
         finally:
             if self.runner is not None:
                 self.runner.stop()
-            self._close_results()
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self._log(f"Deployment {reason}; arm stopped.")
-
-    def _stop_all(self):
-        self.bus.cancel_pending()
-        self.bus.send_now("stop_all")
-        if self._running:
-            self._stop(reason="STOP ALL pressed")
-        else:
-            self._log("Stopped all joints.")
-
-    # -- results -------------------------------------------------------------
-
-    def _open_results(self):
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._result_dir = os.path.join(REPO_DIR, "results", f"deploy_{stamp}")
-        os.makedirs(self._result_dir, exist_ok=True)
-        h, w = self.image_size
-        self._writer = cv2.VideoWriter(
-            os.path.join(self._result_dir, "video.mp4"),
-            cv2.VideoWriter_fourcc(*"mp4v"), self.args.fps, (w, h),
-        )
-        self._log_file = open(os.path.join(self._result_dir, "actions.jsonl"), "w")
-        with open(os.path.join(self._result_dir, "run.json"), "w") as f:
-            json.dump({
-                "checkpoint": self.ck_var.get(),
-                "policy_type": self.runner.policy_type,
-                "task": self.runner.task,
-                "fps": self.args.fps,
-                "n_action_steps": self.runner.n_action_steps,
-                "action_mode": self.mode_action.get(),
-                "device": self.runner.device,
-                "image_size": list(self.image_size),
-                "git_sha": git_sha(),
-                "started": stamp,
-            }, f, indent=2)
-        self._log(f"Recording to {os.path.relpath(self._result_dir, REPO_DIR)}")
-
-    def _close_results(self):
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
-
-    # -- control loop --------------------------------------------------------
+                self.runner = None
+        # The policy left the arm wherever it was; manual state must agree.
+        self._reset_action_state(reopen_gripper=False)
+        self._set_policy_buttons_state()
+        self._update_status_label()
+        self._log(f"Policy {reason} -- back to manual control.", level="warn")
 
     def _control_tick(self):
-        if not self._running:
+        if not self._policy_running:
             return
         self._next_deadline += self._period
-        delay = max(0, int((self._next_deadline - time.monotonic()) * 1000))
+        delay = max(1, int((self._next_deadline - time.monotonic()) * 1000))
         self.after(delay, self._control_tick)
 
         if self.runner is not None and self.runner.error is not None:
-            self._log(f"Inference failed: {self.runner.error}", "error")
-            self._stop(reason="inference error")
+            self._log(f"Inference failed: {self.runner.error}", level="error")
+            self._stop_policy(reason="inference error")
             return
 
         latest = self.camera.get_latest() if self.camera is not None else None
@@ -672,9 +566,7 @@ class DeployApp(tk.Tk):
             self._held_ticks += 1
             if self._held is None or self._held_ticks > MAX_HELD_TICKS:
                 if not self._underrun_reported:
-                    # Once per episode -- a sustained underrun fires every tick and the
-                    # repeats would bury everything else in the log.
-                    self._log("Inference underrun -- stopping the arm", "warn")
+                    self._log("Inference underrun -- stopping the arm", level="warn")
                     self._underrun_reported = True
                 self.bus.cancel_pending()
                 self.bus.send_now("stop_all")
@@ -684,79 +576,195 @@ class DeployApp(tk.Tk):
         else:
             self._held_ticks = 0
             self._underrun_reported = False
-            action = snap_to_levels(raw) if self.mode_action.get() == "snap" else clamp_to_limits(raw)
+            action = snap_to_levels(raw) if self._snap_var.get() else clamp_to_limits(raw)
             self._held = action
 
         dispatch_action(self.bus, action, CHANNELS)
-        self._history.append(action.copy())
-        self._write_tick(rgb, raw, action, underrun)
+        self._current_action[:] = action
+        self._note_action(raw=raw, dispatched=action, underrun=underrun, frame=rgb)
         self._tick_index += 1
+        if self._tick_index % max(1, self.args.fps // 5) == 0:
+            self._update_status_label()
 
-    def _write_tick(self, rgb, raw, action, underrun):
-        if self._writer is not None:
-            self._writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    # -- action history, plots, recording ----------------------------------
+
+    def _note_action(self, raw, dispatched, underrun, frame=None):
+        """One place where an action becomes history, a plot point and a log line."""
+        self._history.append(np.asarray(dispatched, dtype=np.float32).copy())
+        if not self._recording:
+            return
+        if frame is not None and self._writer is not None:
+            self._writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         if self._log_file is None:
             return
         entry = {
             "tick": self._tick_index,
             "t": round(time.time(), 4),
+            "mode": "policy" if self._policy_running else "manual",
             "raw": None if raw is None else [round(float(v), 3) for v in raw],
-            "dispatched": [round(float(v), 3) for v in action],
+            "dispatched": [round(float(v), 3) for v in dispatched],
             "underrun": bool(underrun),
-            "queued": self.runner.queued,
-            "inference_s": (round(self.runner.last_latency, 4)
-                            if self.runner.last_latency else None),
         }
+        if self.runner is not None:
+            entry["queued"] = self.runner.queued
+            entry["inference_s"] = (round(self.runner.last_latency, 4)
+                                    if self.runner.last_latency else None)
         self._log_file.write(json.dumps(entry) + "\n")
 
-    # -- periodic UI ---------------------------------------------------------
+    def _toggle_record(self):
+        if self._recording:
+            self._close_results()
+            self._log(f"Recording stopped -- {os.path.relpath(self._result_dir, REPO_DIR)}")
+        else:
+            self._open_results()
+        self._set_policy_buttons_state()
+        self._update_status_label()
 
-    def _feed_tick(self):
-        self.after(FEED_REFRESH_MS, self._feed_tick)
+    def _open_results(self):
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._result_dir = os.path.join(REPO_DIR, "results", f"deploy_{stamp}")
+        os.makedirs(self._result_dir, exist_ok=True)
+        h, w = self.image_size
+        self._writer = cv2.VideoWriter(
+            os.path.join(self._result_dir, "video.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"), self.args.fps, (w, h),
+        )
+        self._log_file = open(os.path.join(self._result_dir, "actions.jsonl"), "w")
+        with open(os.path.join(self._result_dir, "run.json"), "w") as f:
+            json.dump({
+                "checkpoint": self.args.checkpoint,
+                "task": self.task_var.get().strip(),
+                "fps": self.args.fps,
+                "action_mode": "snap" if self._snap_var.get() else "raw",
+                "policy_type": self.runner.policy_type if self.runner else None,
+                "device": self.runner.device if self.runner else None,
+                "image_size": list(self.image_size),
+                "git_sha": git_sha(),
+                "started": stamp,
+            }, f, indent=2)
+        self._recording = True
+        self._log(f"Recording to {os.path.relpath(self._result_dir, REPO_DIR)}", level="connected")
+
+    def _close_results(self):
+        self._recording = False
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+
+    # -- plot panel --------------------------------------------------------
+
+    def _build_plot_panel(self, parent):
+        """Collapsible, matching the log panel. Four stacked subplots sharing x:
+        one shared y-axis would be useless, since base_motor spans +/-900 while
+        gripper spans 30-120 and the small channels would read as flat lines."""
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self.plot_frame = ttk.Frame(parent, padding=(16, 4, 16, 4))
+        self.plot_frame.pack(side="bottom", fill="x")
+
+        self._plot_expanded = False
+        self.plot_header_var = tk.StringVar()
+        header = ttk.Label(
+            self.plot_frame, textvariable=self.plot_header_var,
+            style="SectionHeading.TLabel", cursor="hand2",
+        )
+        header.pack(anchor="w", pady=(0, 4))
+        header.bind("<Button-1>", lambda e: self._toggle_plot_panel())
+
+        self.plot_body = ttk.Frame(self.plot_frame)
+        self.figure = Figure(figsize=(9, 3.6), dpi=90, facecolor=PALETTE["bg"])
+        self.axes = self.figure.subplots(ACTION_DIM, 1, sharex=True)
+        self._lines = []
+        # "base_motor_speed" wrapped onto three lines is noise; the joint is the
+        # part worth reading, and the unit is on the y-ticks anyway.
+        labels = ["base", "upper arm", "lower arm", "gripper"]
+        for ax, name, (lo, hi) in zip(self.axes, labels, ACTION_COMMAND_LIMITS):
+            ax.set_facecolor(PALETTE["bg"])
+            ax.set_ylim(lo - 0.05 * (hi - lo), hi + 0.05 * (hi - lo))
+            ax.set_ylabel(name, fontsize=7, rotation=0, ha="right", va="center", labelpad=8)
+            ax.tick_params(labelsize=6, colors=PALETTE["muted"])
+            for spine in ax.spines.values():
+                spine.set_color(PALETTE["border"])
+            ax.grid(True, alpha=0.15)
+            self._lines.append(ax.plot([], [], lw=1.2)[0])
+        self.axes[-1].set_xlabel("tick", fontsize=7, color=PALETTE["muted"])
+        self.figure.tight_layout(pad=0.6)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_body)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._update_plot_header()
+
+    def _toggle_plot_panel(self):
+        self._plot_expanded = not self._plot_expanded
+        if self._plot_expanded:
+            self.plot_body.pack(fill="both", expand=True)
+        else:
+            self.plot_body.pack_forget()
+        self._update_plot_header()
+
+    def _update_plot_header(self):
+        arrow = "▼" if self._plot_expanded else "▶"
+        self.plot_header_var.set(
+            f"{arrow} Action plots (click to {'collapse' if self._plot_expanded else 'expand'})"
+        )
+
+    def _plot_tick(self):
+        self.after(PLOT_REFRESH_MS, self._plot_tick)
+        # Drawing a collapsed figure is pure waste on the thread that runs control.
+        if not self._plot_expanded or not self._history:
+            return
+        data = np.stack(self._history)
+        x = np.arange(len(data))
+        for j, line in enumerate(self._lines):
+            line.set_data(x, data[:, j])
+        self.axes[-1].set_xlim(0, max(PLOT_WINDOW, len(data)))
+        self.canvas.draw_idle()
+
+    # -- camera feed -------------------------------------------------------
+
+    def _update_camera_feed(self):
+        self.after(FEED_REFRESH_MS, self._update_camera_feed)
+        self._feed_ticks += 1
+        if not self._policy_running and self._feed_ticks % max(1, 1000 // FEED_REFRESH_MS) == 0:
+            self._update_status_label()
         latest = self.camera.get_latest() if self.camera is not None else None
         if latest is None:
             self._show_camera_placeholder()
             return
         self._note_camera_connected()
-        rgb = resize_keep_aspect(latest[0], self.image_size)
-        store_h, store_w = self.image_size
-        photo = ImageTk.PhotoImage(
-            Image.fromarray(rgb).resize((480, max(1, int(store_h * (480 / store_w)))))
+        frame = latest[0]
+        h, w = frame.shape[:2]
+        scale = DISPLAY_MAX_WIDTH / w
+        small = cv2.resize(frame, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        label = "policy" if self._policy_running else "manual"
+        cv2.putText(rgb, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.camera_label.configure(image=photo)
+        self.camera_label.image = photo
+
+    def _show_camera_placeholder(self):
+        canvas = camera_source.placeholder_frame(
+            self.image_size, self.camera, self._camera_source,
+            self.args.remote_camera_port, DISPLAY_MAX_WIDTH,
         )
-        self.feed.configure(image=photo)
-        self.feed.image = photo
+        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
+        self.camera_label.configure(image=photo)
+        self.camera_label.image = photo
 
-    def _plot_tick(self):
-        self.after(PLOT_REFRESH_MS, self._plot_tick)
-        if not self._history:
-            return
-        data = np.stack(self._history)
-        self.axes.clear()
-        self.axes.set_title("Dispatched action")
-        self.axes.set_xlabel("tick")
-        for j, name in enumerate(ACTION_NAMES):
-            self.axes.plot(data[:, j], label=name)
-        self.axes.legend(loc="upper left", fontsize=7)
-        self.canvas.draw_idle()
-        if self.runner is not None:
-            status = f"tick {self._tick_index}  queued {self.runner.queued}"
-            latency = self.runner.last_latency
-            if latency:
-                # One inference has to cover n_action_steps of motion; over budget
-                # means underruns, which is why this is on screen rather than inferred.
-                budget = self.runner.n_action_steps * self._period
-                status += f"  inference {latency * 1000:.0f}ms / {budget * 1000:.0f}ms budget"
-            self.status_var.set(status)
-
-    # -- teardown ------------------------------------------------------------
+    # -- teardown ----------------------------------------------------------
 
     def _shutdown(self):
         if self._shutting_down:
             return
         self._shutting_down = True
         try:
-            if self._running:
-                self._stop(reason="shutting down")
+            if self._policy_running:
+                self._stop_policy(reason="shutting down")
         except Exception:
             pass
         # Stop the robot first, synchronously, before anything that can fail.
@@ -767,17 +775,24 @@ class DeployApp(tk.Tk):
         except Exception:
             pass
         self._close_results()
-        self._drop_link()
-        try:
-            self.camera.stop()
-        except Exception:
-            pass
+        if self.link is not None:
+            link, self.link = self.link, None
+            self._close_link_quietly(link, reset_board=True)
+        if self.camera is not None:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
         self.destroy()
 
 
 def main():
     args = parse_args()
-    app = DeployApp(args)  # if this raises, no link was opened and nothing is driving
+    if args.list_cameras:
+        for source in camera_source.available_sources():
+            print(" ", camera_source.source_label(source, args.remote_camera_port))
+        return
+    app = DeployApp(args)
     try:
         app.mainloop()
     finally:

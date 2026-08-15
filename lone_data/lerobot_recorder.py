@@ -61,12 +61,20 @@ def has_saved_episodes(root):
     return info is not None and info.get("total_episodes", 0) > 0
 
 
-def _open_local(repo_id, root):
-    """Opens an existing dataset from disk. Anything missing locally is a local
-    problem -- with the Hub disabled (see lone_data/__init__.py) LeRobot's
-    download fallback surfaces as a confusing network error, so say so plainly."""
+def _open_local(repo_id, root, image_writer_threads):
+    """Reopens an existing dataset for appending.
+
+    lerobot 0.6 replaced "construct, then start_image_writer()" with a resume()
+    classmethod that builds the DatasetWriter itself; plain construction now gives
+    a read-only view and start_image_writer no longer exists on the dataset.
+
+    Anything missing locally is a local problem -- with the Hub disabled (see
+    lone_data/__init__.py) LeRobot's download fallback surfaces as a confusing
+    network error, so say so plainly."""
     try:
-        return LeRobotDataset(repo_id, root=root)
+        return LeRobotDataset.resume(
+            repo_id, root=root, image_writer_threads=image_writer_threads
+        )
     except Exception as e:
         raise RuntimeError(
             f"Could not open the dataset at {root}: {e}\n"
@@ -98,10 +106,8 @@ class LoneRecorder:
         # LeRobotDataset treat the missing data as "not downloaded yet" and reach
         # for the Hub. Only a dataset with at least one saved episode is resumable.
         if info is not None and info.get("total_episodes", 0) > 0:
-            # Same resume path lerobot_record.py uses: plain construction gives
-            # back a writable dataset, the image writer just has to be restarted.
-            self.dataset = _open_local(repo_id, root)
-            self.dataset.start_image_writer(num_processes=0, num_threads=image_writer_threads)
+            # LeRobotDataset.resume() is 0.6's writable-reopen path.
+            self.dataset = _open_local(repo_id, root, image_writer_threads)
             self._check_compatible(features)
             self.resumed = True
             self.episodes = self._load_episode_index()
@@ -273,7 +279,7 @@ class LoneRecorder:
             self._episode_open = False
             self.discard_episode_buffer()
         try:
-            self.dataset.stop_image_writer()
+            self.dataset.writer.stop_image_writer()
         except Exception:
             pass
         self.dataset.finalize()
