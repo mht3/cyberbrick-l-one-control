@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backfill the all-zero `observation.state` into a dataset recorded without one.
 
-    python scripts/add_state_column.py [--root data/lerobot/lone/l_one]
+    python scripts/add_state_column.py [--root data/lerobot/lone/l_one_marker_pickup]
 
 L-ONE measures nothing, so the column is zeros -- it exists to give the dataset
 the shape every LeRobot policy expects, not to carry information. See STATE_NAMES
@@ -29,7 +29,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.features import STATE_DIM, STATE_NAMES
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 
 
 def parse_args():

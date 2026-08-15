@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """lerobot-train with this repo's defaults applied.
 
-    python scripts/train.py --policy.type=act --dataset.repo_id=lone/l_one ...
+    python scripts/train.py --policy.type=act --dataset.repo_id=lone/l_one_marker_pickup ...
 
 Takes exactly the arguments lerobot-train takes and forwards them untouched -- see
 the README for the ACT and pi0.5 invocations. It only sets three defaults that

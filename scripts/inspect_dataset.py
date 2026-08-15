@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize an L-ONE LeRobotDataset.
 
-    python scripts/inspect_dataset.py [--root data/lerobot/lone/l_one]
+    python scripts/inspect_dataset.py [--root data/lerobot/lone/l_one_marker_pickup]
 """
 
 import argparse
@@ -22,13 +22,13 @@ from lerobot.utils.constants import ACTION
 from lone_data.features import ACTION_NAMES, ACTION_SEMANTICS, CAMERA_KEY, SYNC_NOTE, ZERO_DISPATCH_CONVENTION
 from lone_data.validation import describe_state_policy_support
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one", help="dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="dataset repo id")
     p.add_argument("--frames", type=int, default=3, help="how many frames to load through __getitem__")
     return p.parse_args()
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prove the L-ONE dataset is a policy-agnostic LeRobotDataset.
 
-    python scripts/test_policy_pipeline.py [--root data/lerobot/lone/l_one]
+    python scripts/test_policy_pipeline.py [--root data/lerobot/lone/l_one_marker_pickup]
 
 Runs on CPU with no weights and no network: it reproduces exactly what
 make_policy() does when wiring dataset features into a policy config
@@ -27,13 +27,13 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.features import ACTION_DIM, CAMERA_KEY, STATE_DIM
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one", help="dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="dataset repo id")
     return p.parse_args()
 
 

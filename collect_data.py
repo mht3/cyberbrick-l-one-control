@@ -98,7 +98,7 @@ def parse_args():
     p.add_argument("--remote-camera-port", type=int, default=8267,
                    help="port to listen on for --remote-camera")
     p.add_argument("--fps", type=int, default=25, help="dataset recording rate")
-    p.add_argument("--repo-id", default="lone/l_one", help="LeRobot dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="LeRobot dataset repo id")
     p.add_argument("--root", default=None, help="dataset directory (default: data/lerobot/<repo-id>)")
     p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1],
                    help="frame width stored in the dataset (must match the camera's aspect ratio)")
@@ -598,7 +598,9 @@ class CollectDataApp(RobotAppBase):
             if self.recorder is not None:
                 self.recorder.close()
                 self.recorder = None
-            changed = set_episode_task(self.dataset_root, episode_idx, new_task)
+            changed = set_episode_task(
+                self.dataset_root, self.args.repo_id, episode_idx, new_task
+            )
         except Exception as e:
             self._log(f"Could not save task: {e}", level="error")
             self._exit_review_mode()
@@ -991,6 +993,9 @@ class CollectDataApp(RobotAppBase):
             self._set_review_buttons_state()
             self._update_status_label()
             return
+
+        if self.recorder.last_warning:
+            self._log(self.recorder.last_warning, level="warn")
 
         if ep_len == 0:
             self._log("Episode had 0 steps -- nothing saved", level="warn")

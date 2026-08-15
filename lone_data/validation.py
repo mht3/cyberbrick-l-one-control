@@ -13,6 +13,14 @@ from lone_data.features import ACTION_DIM, ACTION_NAMES, CAMERA_KEY
 
 TIMESTAMP_TOLERANCE_S = 1e-4
 
+# The repair for either task-table fault below: rewrite meta/tasks.parquet's
+# task_index to 0..N-1 in the row order already there, then remap the task_index
+# column in data/**.parquet through the same old->new mapping. Task strings, row
+# order and episode metadata stay as they are -- only the integer used to reach a
+# task changes -- so no episode ends up pointing at different text.
+TASK_REMEDY = ("Renumber meta/tasks.parquet so task_index equals row position, "
+               "remapping data/**.parquet task_index to match.")
+
 
 def validate_dataset(ds):
     warnings = []
@@ -47,8 +55,17 @@ def validate_dataset(ds):
     if len(cam_ft["shape"]) != 3:
         warnings.append(f"{CAMERA_KEY} shape {cam_ft['shape']} is not 3-dimensional")
 
-    warnings += _check_frames(ds)
     warnings += _check_tasks(ds)
+
+    # Reading any frame resolves item["task"] through the task table, so that has
+    # to be sound before a frame is touched -- otherwise the sampling below raises
+    # instead of reporting, and takes every remaining check down with it.
+    if _tasks_resolvable(ds):
+        warnings += _check_frames(ds)
+    else:
+        warnings.append("skipped frame checks -- every frame read raises while the "
+                        "task table is unusable; rerun once it is repaired")
+
     warnings += _check_stats(ds)
     return warnings
 
@@ -132,6 +149,39 @@ def _check_frames(ds):
     return warnings
 
 
+def _positional_task_gaps(ds):
+    """Rows of meta/tasks.parquet whose task_index differs from their position.
+
+    lerobot reads a frame's task string as `tasks.iloc[task_index].name` --
+    positionally -- so the task_index column is only ever as good as its agreement
+    with row order. Nothing in lerobot enforces that, and editing tasks can break
+    it: drop a row without renumbering and every later index resolves one task
+    early, or off the end of the table entirely. Returns [] when they agree.
+    """
+    tasks = getattr(ds.meta, "tasks", None)
+    if tasks is None or not hasattr(tasks, "columns") or "task_index" not in tasks.columns:
+        return []
+    return [
+        (position, int(recorded))
+        for position, recorded in enumerate(tasks["task_index"])
+        if int(recorded) != position
+    ]
+
+
+def _tasks_resolvable(ds):
+    """Whether every frame's task_index lands on the task it names."""
+    return not _positional_task_gaps(ds) and not _out_of_range_task_indices(ds)
+
+
+def _out_of_range_task_indices(ds):
+    """Frame task_index values with no row at that position -- these raise IndexError."""
+    tasks = getattr(ds.meta, "tasks", None)
+    if tasks is None:
+        return []
+    used = np.unique(np.asarray(ds.hf_dataset["task_index"], dtype=np.int64))
+    return sorted(int(v) for v in used if v < 0 or v >= len(tasks))
+
+
 def _check_tasks(ds):
     warnings = []
     tasks = ds.meta.tasks
@@ -142,6 +192,25 @@ def _check_tasks(ds):
     for task in names:
         if not str(task).strip():
             warnings.append("dataset contains an empty task string")
+
+    out_of_range = _out_of_range_task_indices(ds)
+    if out_of_range:
+        warnings.append(
+            f"frames use task_index {out_of_range} but meta/tasks.parquet has only "
+            f"{len(tasks)} rows -- reading those frames raises IndexError. {TASK_REMEDY}"
+        )
+
+    gaps = _positional_task_gaps(ds)
+    if gaps:
+        # Silent by construction: an in-range index still resolves, just to the
+        # wrong string, so nothing downstream notices the episodes are mislabelled.
+        shown = ", ".join(f"row {p} holds task_index {r}" for p, r in gaps[:3])
+        warnings.append(
+            f"{len(gaps)} task(s) sit at a row that does not match their task_index "
+            f"({shown}{', ...' if len(gaps) > 3 else ''}). lerobot resolves tasks by "
+            "row position, so affected frames silently train on another task's text. "
+            f"{TASK_REMEDY}"
+        )
     return warnings
 
 
@@ -153,9 +222,20 @@ def describe_state_policy_support(ds):
             f"{OBS_STATE} absent. ACT and pi0/pi0.5 raise without a state tensor, and\n"
             "  Diffusion Policy and SmolVLA cannot even build. Run scripts/add_state_column.py."
         )
+    # Verified against lerobot 0.6.1: all four consume the state, by different
+    # routes. ACT projects it to a token for both the VAE and transformer encoders
+    # (modeling_act.py:413,465); pi0.5 has no state_proj because it discretises the
+    # state into 256 bins and writes it into the text prompt instead
+    # (processor_pi05.py:68-74); Diffusion Policy passes it as global conditioning
+    # (modeling_diffusion.py:273); SmolVLA embeds it via state_proj
+    # (modeling_smolvla.py:508,619). So the column is not decorative -- it reaches
+    # the network in every case. All zeros makes it a constant input, which is
+    # uninformative but harmless: a constant is something a network can absorb.
     return (
         f"{OBS_STATE} present and all zeros -- L-ONE has no proprioceptive sensors.\n"
-        "  Every policy accepts this schema, and every one of them is vision-only in\n"
-        "  substance: ACT and pi0.5 never feed the state to the network at all, and\n"
-        "  Diffusion Policy and SmolVLA feed in a constant."
+        "  Every policy both requires this schema and feeds the values to the network:\n"
+        "  ACT as an encoder token, pi0.5 discretised into the prompt text, Diffusion\n"
+        "  Policy as global conditioning, SmolVLA through state_proj. Being all zeros,\n"
+        "  each receives a constant -- so they are vision-only in substance, not because\n"
+        "  the state is ignored but because it never varies."
     )

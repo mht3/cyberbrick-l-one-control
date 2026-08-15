@@ -55,7 +55,7 @@ from lerobot.utils.constants import ACTION
 
 from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_NAMES
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 SPANS = np.array([hi - lo for lo, hi in ACTION_COMMAND_LIMITS], dtype=np.float64)
 
 
@@ -65,7 +65,7 @@ def parse_args():
     )
     p.add_argument("--checkpoint", required=True, help="a checkpoint's pretrained_model/ directory")
     p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one", help="dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="dataset repo id")
     p.add_argument("--episodes", default=None, help="comma-separated episode indices (default: all)")
     p.add_argument("--max-frames", type=int, default=200, help="cap on frames scored")
     p.add_argument("--repeats", type=int, default=8,

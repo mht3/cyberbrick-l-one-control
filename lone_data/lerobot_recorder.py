@@ -50,6 +50,11 @@ def _first_task(tasks):
     return tasks
 
 
+def _first(value):
+    """Unwrap a latest_episode field, which holds one-element lists per column."""
+    return value[0] if isinstance(value, (list, tuple)) else value
+
+
 def has_saved_episodes(root):
     """Whether `root` holds a dataset with at least one saved episode.
 
@@ -96,6 +101,7 @@ class LoneRecorder:
         self._closed = False
         self.episodes = []          # one record per saved episode, for playback
         self.episode_actions = {}   # episode_index -> (T,4) float32, this session only
+        self.last_warning = None    # set by finish_episode; the GUI surfaces it
 
         features = lone_features(self.image_size)
         info = _read_info(root)
@@ -249,8 +255,43 @@ class LoneRecorder:
             self.discard_episode_buffer()
             return 0
         self.dataset.save_episode()
+        self.last_warning = self._check_saved_video_span()
         self._record_saved_episode(self._pending_task, self._pending_actions)
         return self._frames
+
+    def _check_saved_video_span(self):
+        """Verify the episode just saved occupies exactly length/fps of video.
+
+        lerobot *defines* to_timestamp as from_timestamp + length/fps when it
+        writes episode metadata, and asserts it later in delete_episodes(). Frames
+        that outlive a discarded take break that: they are encoded ahead of the
+        next episode's own frames, so its segment runs longer than its frame count
+        and every following from_timestamp shifts with it.
+
+        Nothing reads the video back during collection, so the damage is silent --
+        it surfaces much later as an assertion inside an unrelated operation, long
+        after the session that caused it. Checking here names the episode while the
+        operator can still act on it. Returns a message, or None when consistent.
+        """
+        ep = self.dataset.meta.latest_episode
+        try:
+            span = float(_first(ep[f"videos/{CAMERA_KEY}/to_timestamp"])) - float(
+                _first(ep[f"videos/{CAMERA_KEY}/from_timestamp"])
+            )
+            length = int(_first(ep["length"]))
+            index = int(_first(ep["episode_index"]))
+        except (KeyError, TypeError, IndexError):
+            return None  # metadata shape changed; not worth failing a save over
+
+        expected = length / self.fps
+        if abs(span - expected) <= 1.0 / self.fps:
+            return None
+        return (
+            f"episode {index:06d} occupies {span:.2f}s of video but holds {length} "
+            f"frames ({expected:.2f}s) -- {span - expected:+.2f}s of stray footage was "
+            "encoded into it, most likely frames left over from a discarded take. "
+            "The dataset is still readable, but delete_episodes() will refuse it."
+        )
 
     def discard_episode(self):
         if not self._episode_open:
@@ -260,12 +301,26 @@ class LoneRecorder:
         self.discard_episode_buffer()
         return dropped
 
-    def discard_episode_buffer(self):
+    def discard_episode_buffer(self, best_effort=False):
+        """Drop the open episode's buffer, its already-written frames included.
+
+        Failing to clear is not cosmetic, so it is raised rather than ignored: the
+        frames stay queued for the video file and are encoded into whichever
+        episode is saved next, corrupting it in the way _check_saved_video_span
+        describes. Silently continuing is what lets that reach the dataset.
+
+        best_effort is for teardown only, where finalize() still has to run.
+        """
         self._frames = 0
         try:
             self.dataset.clear_episode_buffer()
-        except Exception:
-            pass  # nothing buffered yet, or already cleared
+        except Exception as e:
+            if not best_effort:
+                raise RuntimeError(
+                    f"Could not discard the episode buffer ({e}). Its frames may still "
+                    "be encoded into the next episode you save -- restart the session "
+                    "before recording again."
+                ) from e
 
     # -- teardown ----------------------------------------------------------
 
@@ -277,7 +332,9 @@ class LoneRecorder:
         self._closed = True
         if self._episode_open:
             self._episode_open = False
-            self.discard_episode_buffer()
+            # Teardown: finalize() below still has to run, so a failed clear must
+            # not abort it. Anything left behind is caught on the next save.
+            self.discard_episode_buffer(best_effort=True)
         try:
             self.dataset.writer.stop_image_writer()
         except Exception:

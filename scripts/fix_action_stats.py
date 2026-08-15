@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rewrite a dataset's `action` normalization statistics to the known command limits.
 
-    python scripts/fix_action_stats.py [--root data/lerobot/lone/l_one]
+    python scripts/fix_action_stats.py [--root data/lerobot/lone/l_one_marker_pickup]
 
 Rerun this after every collection session. `LeRobotDataset.save_episode()` calls
 aggregate_stats() and write_stats() on each saved episode (lerobot_dataset.py:424),
@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_NAMES
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 
 
 def parse_args():

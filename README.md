@@ -160,7 +160,7 @@ fps, missed deadlines, command latency) goes to `logs/collection_*.jsonl`, outsi
 python scripts/inspect_dataset.py       # schema, action ranges, tasks, episode lengths
 python scripts/validate_dataset.py      # self-consistency checks; non-zero exit on failure
 python scripts/test_policy_pipeline.py  # what each policy makes of the dataset
-lerobot-dataset-viz --repo-id lone/l_one --root data/lerobot/lone/l_one
+lerobot-dataset-viz --repo-id lone/l_one_marker_pickup --root data/lerobot/lone/l_one_marker_pickup
 ```
 
 ### Normalization statistics
@@ -196,8 +196,8 @@ ACT is the cheaper baseline, needs no Hub access, and takes no `empty_cameras`:
 
 ```sh
 python scripts/train.py \
-  --dataset.repo_id=lone/l_one \
-  --dataset.root=data/lerobot/lone/l_one \
+  --dataset.repo_id=lone/l_one_marker_pickup \
+  --dataset.root=data/lerobot/lone/l_one_marker_pickup \
   --policy.type=act \
   --policy.device=cuda \
   --batch_size=8 --steps=30000
@@ -228,8 +228,8 @@ empty. Unlike ACT it needs Hub access, for the gated PaliGemma tokenizer and the
 hf auth login   # google/paligemma-3b-pt-224 is gated; accept its licence first
 
 python scripts/train.py \
-  --dataset.repo_id=lone/l_one \
-  --dataset.root=data/lerobot/lone/l_one \
+  --dataset.repo_id=lone/l_one_marker_pickup \
+  --dataset.root=data/lerobot/lone/l_one_marker_pickup \
   --policy.type=pi05 \
   --policy.pretrained_path=lerobot/pi05_base \
   --policy.empty_cameras=2 \
