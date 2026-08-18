@@ -53,6 +53,7 @@ from virtual_gripper import (
 )
 
 from lone_data import camera_source
+from lone_data.checkpoints import dataset_tasks, training_dataset
 from lone_data.command_bus import CommandBus
 from lone_data.dispatch import clamp_to_limits, dispatch_action, snap_to_levels
 from lone_data.features import (
@@ -70,12 +71,21 @@ CHANNELS = (BASE_MOTOR, UPPER_ARM_SERVO, LOWER_ARM_SERVO, GRIPPER_SERVO)
 DISPLAY_MAX_WIDTH = 640
 FEED_REFRESH_MS = 50    # ~20Hz preview, deliberately below the control rate
 PLOT_REFRESH_MS = 100   # ~10Hz, slower still so drawing never competes with control
-PLOT_WINDOW = 200       # ticks kept on screen
+PLOT_WINDOW_S = 8.0     # seconds of wall-clock history on screen
+PLOT_MAX_SAMPLES = 4000  # hard bound on the buffer; the window is what trims it
 MAX_HELD_TICKS = 3      # ticks to reuse the last action before stopping
+PRIME_WARN_S = 2.0      # waiting this long for a run's first chunk is worth saying
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
+def build_parser(description=__doc__):
+    """The deployment argument set, as a parser a peer script can add to.
+
+    deploy_policy_training_data_replay.py subclasses DeployApp, which reaches
+    through RobotAppBase into args.remote_camera_port, args.width/height and
+    args.camera_fps -- so it needs these arguments present, not a fresh parser
+    with a subset of them.
+    """
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("--checkpoint", default=None,
                    help="a checkpoint's pretrained_model/ directory (required to run a policy)")
     p.add_argument("--task", default="", help="task prompt (defaults to the checkpoint's)")
@@ -93,7 +103,11 @@ def parse_args():
     p.add_argument("--device", default=None)
     p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1])
     p.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_SIZE[0])
-    return p.parse_args()
+    return p
+
+
+def parse_args():
+    return build_parser().parse_args()
 
 
 def git_sha():
@@ -114,25 +128,10 @@ def checkpoint_task(checkpoint):
     which dataset was used -- so follow that pointer and read the task out of the
     dataset's metadata. Returns "" if the dataset is not on this machine.
     """
-    path = os.path.join(checkpoint or "", "train_config.json")
-    if not os.path.exists(path):
+    repo_id, root = training_dataset(checkpoint)
+    if not repo_id or not root:
         return ""
-    try:
-        with open(path) as f:
-            dataset = json.load(f).get("dataset", {})
-    except (OSError, json.JSONDecodeError):
-        return ""
-    root, repo_id = dataset.get("root"), dataset.get("repo_id")
-    if not root or not repo_id:
-        return ""
-    if not os.path.isabs(root):
-        root = os.path.join(REPO_DIR, root)
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
-        tasks = list(LeRobotDatasetMetadata(repo_id, root=root).tasks.index)
-    except Exception:
-        return ""
+    tasks = dataset_tasks(repo_id, root)
     # Several tasks means the run was multi-task and no single prompt is right.
     return tasks[0] if len(tasks) == 1 else ""
 
@@ -154,16 +153,21 @@ class PolicyRunner:
 
     Inference is far too slow to run inline with a 25-30Hz control tick, so the
     thread keeps a queue filled and the caller only ever pops.
+
+    Constructing this loads the weights, which for pi0.5 is seconds of disk and
+    host-to-device copying; the task prompt arrives per run at `start()` instead,
+    so one instance serves every rollout of a session and a checkpoint is never
+    loaded twice.
     """
 
-    def __init__(self, checkpoint, task, device=None, n_action_steps=None):
+    def __init__(self, checkpoint, device=None, n_action_steps=None):
         import torch
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         self.torch = torch
         self.checkpoint = checkpoint
-        self.task = task
+        self.task = ""
 
         cfg = PreTrainedConfig.from_pretrained(checkpoint)
         if device:
@@ -178,14 +182,31 @@ class PolicyRunner:
         self._pending = deque()
         self._lock = threading.Lock()
         self._frame = None
+        # Caller-supplied label for the frame currently staged for inference. Every
+        # action the worker queues carries the label of the frame it was predicted
+        # from, which is the only way to know afterwards how stale a dispatched
+        # action was -- queue depth alone cannot recover it.
+        self._frame_meta = None
         self._running = False
         self._thread = None
+        # Bumped per run so a worker that outlived its stop() -- join() times out
+        # while an inference is still in flight -- cannot push actions into the
+        # next run's queue or report its error against it.
+        self._generation = 0
         self.last_latency = None
         self.error = None
 
-    def start(self):
+    def start(self, task):
+        """Serve actions for `task`, from a clean queue. Reusable across runs."""
+        self.stop()
+        self.task = task
+        self.error = None
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self.last_latency = None
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(generation,), daemon=True)
         self._thread.start()
 
     def stop(self):
@@ -193,12 +214,25 @@ class PolicyRunner:
         if self._thread is not None:
             self._thread.join(timeout=3)
             self._thread = None
+        with self._lock:
+            # Actions predicted from the old run's frames must not survive into
+            # the next one, and a stale frame must not seed its first inference.
+            self._pending.clear()
+            self._frame = None
+            self._frame_meta = None
 
-    def submit_frame(self, rgb):
+    def submit_frame(self, rgb, meta=None):
         with self._lock:
             self._frame = rgb
+            self._frame_meta = meta
 
     def pop(self):
+        """(action, meta) for the next action, or None if the queue is empty.
+
+        `meta` is whatever submit_frame() was given for the frame this action was
+        predicted from -- None in live deployment, the dataset frame index in the
+        training-data replay.
+        """
         with self._lock:
             return self._pending.popleft() if self._pending else None
 
@@ -206,6 +240,16 @@ class PolicyRunner:
     def queued(self):
         with self._lock:
             return len(self._pending)
+
+    @property
+    def is_serving(self):
+        """Whether a worker is actually producing actions right now.
+
+        False for a loaded-but-idle runner, which is not the same as a queue that
+        happens to be empty: the training-data replay can drive the arm from the
+        recording with the policy loaded and deliberately out of the loop.
+        """
+        return self._running
 
     def _observation(self, rgb):
         # Must match what the dataset delivered at training time: CHW float in [0,1].
@@ -216,11 +260,11 @@ class PolicyRunner:
             "task": self.task,
         }
 
-    def _run(self):
-        while self._running:
+    def _run(self, generation):
+        while self._running and generation == self._generation:
             with self._lock:
                 need = len(self._pending) < self.n_action_steps
-                frame = self._frame
+                frame, meta = self._frame, self._frame_meta
             if not need or frame is None:
                 time.sleep(0.005)
                 continue
@@ -235,10 +279,14 @@ class PolicyRunner:
                 actions = self.post(chunk)[0].float().cpu().numpy()
                 latency = time.perf_counter() - started
                 with self._lock:
+                    if generation != self._generation:
+                        return
                     for action in actions[: self.n_action_steps]:
-                        self._pending.append(np.asarray(action, dtype=np.float32))
+                        self._pending.append((np.asarray(action, dtype=np.float32), meta))
                     self.last_latency = latency
             except Exception as e:  # surfaced on the Tk thread by the caller
+                if generation != self._generation:
+                    return
                 self.error = e
                 self._running = False
                 return
@@ -282,6 +330,8 @@ class DeployApp(RobotAppBase):
         )
         self._camera_connected = False
         self.image_size = (args.image_height, args.image_width)
+        # Instance-level so a subclass showing two video panes can narrow both.
+        self._display_width = DISPLAY_MAX_WIDTH
 
         # -- action state --------------------------------------------------
         # _current_action is the single record of what was last commanded, whoever
@@ -289,19 +339,37 @@ class DeployApp(RobotAppBase):
         # identically in manual and policy mode and cannot disagree about what the
         # arm was told to do.
         self._current_action = np.zeros(ACTION_DIM, dtype=np.float32)
-        self._history = deque(maxlen=PLOT_WINDOW)
+        # (wall-clock time, action) pairs. Timestamped rather than counted because
+        # actions do not arrive on a regular grid -- manual control emits one per
+        # keypress and none while the arm is still -- so an index axis would draw
+        # a stalled minute and a busy second at the same width.
+        self._history = deque(maxlen=PLOT_MAX_SAMPLES)
         self._period = 1.0 / args.fps
         self._feed_ticks = 0
 
         # -- policy state --------------------------------------------------
+        # The runner is built once, at startup, and outlives every rollout: it
+        # holds the loaded weights, and only the task and the action queue are
+        # per-run. `None` means no checkpoint, or one that failed to load.
         self.runner = None
+        self._policy_loading = False
         self._policy_running = False
         self._next_deadline = None
         self._held = None
         self._held_ticks = 0
         self._underrun_reported = False
+        self._priming = False
+        self._prime_started = None
+        self._prime_warned = False
         self._tick_index = 0
         self._last_raw = None
+        # Label of the frame the action being dispatched was predicted from; see
+        # PolicyRunner.submit_frame. Always None in live deployment.
+        self._action_meta = None
+        # What the board was last told. dispatch_action() sends only the difference
+        # against it; None means "re-send everything", which is what a run's first
+        # tick and anything after a stop_all need.
+        self._last_dispatched = None
 
         # -- recording state (results/ only; never a LeRobotDataset) --------
         self._recording = False
@@ -336,12 +404,17 @@ class DeployApp(RobotAppBase):
         self.camera_label = ttk.Label(video_group)
         self.camera_label.pack()
 
+        # Below the camera pane, in the same column: a subclass with a second video
+        # source stacks it under the live one rather than competing for width.
+        self._build_extra_video_panel(camera_frame)
+
         right = ttk.Frame(main_row, padding=(8, 16, 16, 16))
         right.pack(side="left", fill="y")
 
         self._build_connection_bar(right)
         self.joint_controls_frame = self._build_controls(right)
         self._build_policy_controls(right)
+        self._build_extra_controls(right)
 
         self._setup_keybindings()
         self.bind_all("<Button-1>", self._maybe_reclaim_focus, add="+")
@@ -355,11 +428,7 @@ class DeployApp(RobotAppBase):
         self._update_status_label()
         self.focus_set()
 
-        problem = validate_checkpoint(args.checkpoint)
-        if problem:
-            self._log(problem, level="warn")
-        else:
-            self._log(f"Checkpoint: {args.checkpoint}")
+        self._begin_policy_load()
 
         if not self._open_camera(self._camera_source):
             self._log("Pick another source from the Camera dropdown, or run "
@@ -397,7 +466,69 @@ class DeployApp(RobotAppBase):
     def _on_action_changed(self):
         """Manual control just moved a joint: record it like a policy action would be."""
         if not self._policy_running:
+            # Manual control talks to the bus directly rather than through
+            # dispatch_action(), so what the board holds no longer matches the cache.
+            self._last_dispatched = None
             self._note_action(raw=None, dispatched=self._current_action, underrun=False)
+
+    def _held_speeds(self):
+        """While the policy drives, the held speeds are its, not JointControl's."""
+        if self._policy_running:
+            return tuple(float(v) for v in self._current_action[:3])
+        return super()._held_speeds()
+
+    # -- hooks: defaults are the live-camera deployment --------------------
+    #
+    # deploy_policy_training_data_replay.py is this app with the camera swapped for
+    # a recorded episode. It subclasses rather than copies, so the checkpoint, the
+    # action queue, snapping, dispatch and logging it exercises are the ones that
+    # actually run on the arm -- these are the seams where the two differ.
+
+    def _build_extra_video_panel(self, parent):
+        """Another video pane, stacked under the camera one."""
+
+    def _build_extra_controls(self, parent):
+        """More controls, below the policy section."""
+
+    def _policy_observation(self):
+        """(rgb, meta) for this tick, or (None, None) if there is no frame yet.
+
+        `rgb` is what the policy sees, at self.image_size; `meta` labels where it
+        came from and rides along with every action predicted from it.
+        """
+        latest = self.camera.get_latest() if self.camera is not None else None
+        if latest is None:
+            return None, None
+        return resize_keep_aspect(latest[0], self.image_size), None
+
+    def _observation_ready(self):
+        """Why the policy cannot be started yet, or None.
+
+        Starting blind would drive the arm from whatever frame arrives first.
+        """
+        if self.camera is None or self.camera.get_latest() is None:
+            return "No camera frame yet -- wait for the feed before starting."
+        return None
+
+    def _extra_log_fields(self):
+        """Additional keys for this tick's actions.jsonl entry."""
+        return {}
+
+    def _run_metadata(self):
+        """The dict written to a recording's run.json."""
+        return {
+            "checkpoint": self.args.checkpoint,
+            "task": self.task_var.get().strip(),
+            "fps": self.args.fps,
+            "action_mode": "snap" if self._snap_var.get() else "raw",
+            "policy_type": self.runner.policy_type if self.runner else None,
+            "device": self.runner.device if self.runner else None,
+            "image_size": list(self.image_size),
+            "git_sha": git_sha(),
+        }
+
+    def _draw_extra_plots(self, now):
+        """Extra traces on self.axes, before the canvas is redrawn."""
 
     # -- policy controls ---------------------------------------------------
 
@@ -449,8 +580,9 @@ class DeployApp(RobotAppBase):
     def _set_policy_buttons_state(self):
         can_start = (
             not self._policy_running
+            and not self._policy_loading
             and self.link is not None
-            and validate_checkpoint(self.args.checkpoint) is None
+            and self.runner is not None
         )
         self.start_policy_btn.state(["!disabled"] if can_start else ["disabled"])
         self.stop_policy_btn.state(["!disabled"] if self._policy_running else ["disabled"])
@@ -464,12 +596,23 @@ class DeployApp(RobotAppBase):
     def _update_status_label(self):
         if self._policy_running and self.runner is not None:
             latency = self.runner.last_latency
-            budget = self.runner.n_action_steps * self._period
+            # n_action_steps - 1: the worker refills as soon as the queue drops
+            # below a full chunk, which is the first pop, so what it has to beat
+            # is the drain of what is left after that pop -- not the whole chunk.
+            budget = max(1, self.runner.n_action_steps - 1) * self._period
             detail = f"queued {self.runner.queued}"
             if latency:
                 detail += f"  ·  inference {latency * 1000:.0f}ms / {budget * 1000:.0f}ms budget"
-            self.policy_status_var.set(f"Policy running -- tick {self._tick_index}")
+            self.policy_status_var.set(
+                "Policy priming -- waiting for the first actions"
+                if self._priming else f"Policy running -- tick {self._tick_index}"
+            )
             self.policy_detail_var.set(detail)
+        elif self._policy_loading:
+            self.policy_status_var.set("Loading checkpoint...")
+            self.policy_detail_var.set(
+                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
+            )
         else:
             self.policy_status_var.set(
                 "Recording (manual control)." if self._recording else "Manual control."
@@ -480,19 +623,73 @@ class DeployApp(RobotAppBase):
 
     # -- policy lifecycle --------------------------------------------------
 
-    def _start_policy(self):
-        if self._policy_running:
-            return
+    def _begin_policy_load(self):
+        """Load the checkpoint once, at startup, off the Tk thread.
+
+        pi0.5 is ~4B parameters and takes tens of seconds to reach the GPU. Doing
+        that on the first Start Policy click froze the window at the moment the
+        arm was about to move, and paid the cost again on every later run; doing
+        it inline here would just move the freeze to launch. So it happens on a
+        worker while the GUI comes up, and Start stays disabled until it lands.
+        """
         problem = validate_checkpoint(self.args.checkpoint)
         if problem:
             self._log(problem, level="warn")
             return
+        self._log(f"Checkpoint: {self.args.checkpoint}")
+        self._log("Loading checkpoint...")
+        self._policy_loading = True
+        self._load_started = time.monotonic()
+        self._set_policy_buttons_state()
+        self._update_status_label()
+        threading.Thread(target=self._load_policy_worker, daemon=True).start()
+
+    def _load_policy_worker(self):
+        try:
+            runner = PolicyRunner(
+                self.args.checkpoint,
+                device=self.args.device,
+                n_action_steps=self.args.n_action_steps,
+            )
+        except Exception as e:
+            runner, error = None, e
+        else:
+            error = None
+        try:
+            self.after(0, self._on_policy_loaded, runner, error)
+        except Exception:
+            pass  # window already gone
+
+    def _on_policy_loaded(self, runner, error):
+        self._policy_loading = False
+        if self._shutting_down:
+            return
+        if error is not None:
+            self._log(f"Could not load checkpoint: {error}", level="error")
+        else:
+            self.runner = runner
+            self._log(f"Checkpoint ready in {time.monotonic() - self._load_started:.0f}s: "
+                      f"{runner.policy_type} on {runner.device}, "
+                      f"{runner.n_action_steps} actions per inference", level="connected")
+        self._set_policy_buttons_state()
+        self._update_status_label()
+
+    def _start_policy(self):
+        if self._policy_running:
+            return
+        if self._policy_loading:
+            self._log("Checkpoint is still loading.", level="warn")
+            return
+        if self.runner is None:
+            self._log(validate_checkpoint(self.args.checkpoint)
+                      or "Checkpoint failed to load; restart to retry.", level="warn")
+            return
         if self.link is None:
             self._log("Connect to the board before starting the policy.", level="warn")
             return
-        if self.camera is None or self.camera.get_latest() is None:
-            # Starting blind would drive the arm from whatever frame arrives first.
-            self._log("No camera frame yet -- wait for the feed before starting.", level="warn")
+        not_ready = self._observation_ready()
+        if not_ready:
+            self._log(not_ready, level="warn")
             return
         task = self.task_var.get().strip()
         if not task:
@@ -500,27 +697,29 @@ class DeployApp(RobotAppBase):
             self.task_entry.focus_set()
             return
 
-        self._log("Loading checkpoint...")
-        self.update_idletasks()
-        try:
-            self.runner = PolicyRunner(
-                self.args.checkpoint, task,
-                device=self.args.device, n_action_steps=self.args.n_action_steps,
-            )
-        except Exception as e:
-            self._log(f"Could not load checkpoint: {e}", level="error")
-            self.runner = None
-            return
-
-        self.runner.start()
+        self.runner.start(task)
+        # Hand over from a known state: manual control may have left a joint
+        # driving, and the policy's first action is a whole inference away.
+        self.bus.cancel_pending()
+        self.bus.send_now("stop_all")
+        self._current_action[0:3] = 0.0
         self._policy_running = True
         self._held = None
         self._held_ticks = 0
+        self._action_meta = None
+        # stop_all bypassed the bus, so nothing the board holds can be assumed.
+        self._last_dispatched = None
         self._underrun_reported = False
         self._tick_index = 0
+        # Priming: no chunk has arrived yet. An empty queue means the first
+        # inference is still running, which is not the same failure as the queue
+        # running dry mid-rollout, and must not be reported as one.
+        self._priming = True
+        self._prime_started = time.monotonic()
+        self._prime_warned = False
+        self._note_action(raw=None, dispatched=self._current_action, underrun=False)
         self._set_policy_buttons_state()
-        self._log(f"Policy running: {self.runner.policy_type} on {self.runner.device}, "
-                  f"{self.runner.n_action_steps} actions per inference", level="connected")
+        self._log(f"Policy running: {task!r}", level="connected")
         self._next_deadline = time.monotonic()
         self._control_tick()
 
@@ -528,13 +727,13 @@ class DeployApp(RobotAppBase):
         if not self._policy_running:
             return
         self._policy_running = False
+        self._last_dispatched = None
         try:
             self.bus.cancel_pending()
             self.bus.send_now("stop_all")
         finally:
             if self.runner is not None:
-                self.runner.stop()
-                self.runner = None
+                self.runner.stop()  # the loaded weights stay, for the next run
         # The policy left the arm wherever it was; manual state must agree.
         self._reset_action_state(reopen_gripper=False)
         self._set_policy_buttons_state()
@@ -553,14 +752,25 @@ class DeployApp(RobotAppBase):
             self._stop_policy(reason="inference error")
             return
 
-        latest = self.camera.get_latest() if self.camera is not None else None
-        if latest is None:
+        rgb, meta = self._policy_observation()
+        if rgb is None:
             return
-        rgb = resize_keep_aspect(latest[0], self.image_size)
-        self.runner.submit_frame(rgb)
+        self.runner.submit_frame(rgb, meta)
 
-        raw = self.runner.pop()
-        underrun = raw is None
+        popped = self.runner.pop()
+        underrun = popped is None
+        if underrun and self._priming:
+            # The frame that triggers the first inference was submitted three
+            # lines above, on this very tick, so the queue cannot possibly have
+            # anything in it yet -- every run began by announcing an underrun and
+            # stopping an arm that was already stopped. Nothing is dispatched
+            # until the first chunk lands; the arm stays where teleop left it.
+            waited = time.monotonic() - self._prime_started
+            if waited > PRIME_WARN_S and not self._prime_warned:
+                self._log(f"No actions yet, {waited:.1f}s after start -- the first "
+                          "inference is slower than usual.", level="warn")
+                self._prime_warned = True
+            return
         if underrun:
             # Hold briefly through jitter, then stop rather than drive on stale commands.
             self._held_ticks += 1
@@ -571,15 +781,28 @@ class DeployApp(RobotAppBase):
                 self.bus.cancel_pending()
                 self.bus.send_now("stop_all")
                 self._held = None
+                self._last_dispatched = None
+                # A stop is a command like any other, and on a time axis that
+                # holds the last value to the present, leaving it unrecorded
+                # draws the arm as still driving at whatever it drove at last.
+                # stop_all leaves the gripper where it is, so only 0-2 zero.
+                self._current_action[0:3] = 0.0
+                self._note_action(raw=None, dispatched=self._current_action,
+                                  underrun=True, frame=rgb)
                 return
-            action = self._held
+            # A held action is still the one predicted from its original frame, so
+            # its label carries over rather than going blank for the held ticks.
+            action, raw = self._held, None
         else:
+            self._priming = False
             self._held_ticks = 0
             self._underrun_reported = False
+            raw, self._action_meta = popped
             action = snap_to_levels(raw) if self._snap_var.get() else clamp_to_limits(raw)
             self._held = action
 
-        dispatch_action(self.bus, action, CHANNELS)
+        dispatch_action(self.bus, action, CHANNELS, last=self._last_dispatched)
+        self._last_dispatched = np.asarray(action, dtype=np.float32).copy()
         self._current_action[:] = action
         self._note_action(raw=raw, dispatched=action, underrun=underrun, frame=rgb)
         self._tick_index += 1
@@ -590,7 +813,7 @@ class DeployApp(RobotAppBase):
 
     def _note_action(self, raw, dispatched, underrun, frame=None):
         """One place where an action becomes history, a plot point and a log line."""
-        self._history.append(np.asarray(dispatched, dtype=np.float32).copy())
+        self._history.append((time.time(), np.asarray(dispatched, dtype=np.float32).copy()))
         if not self._recording:
             return
         if frame is not None and self._writer is not None:
@@ -605,10 +828,26 @@ class DeployApp(RobotAppBase):
             "dispatched": [round(float(v), 3) for v in dispatched],
             "underrun": bool(underrun),
         }
-        if self.runner is not None:
+        # Only while the policy drives: the runner is loaded in manual mode too,
+        # and an idle queue depth logged against a hand-driven tick reads as if a
+        # policy had been involved in it. Same for a tick driven from a recording
+        # with the policy deliberately out of the loop.
+        if self._policy_running and self.runner is not None and self.runner.is_serving:
             entry["queued"] = self.runner.queued
             entry["inference_s"] = (round(self.runner.last_latency, 4)
                                     if self.runner.last_latency else None)
+        # What the link did with it. Without these the log records what was
+        # *submitted* and says nothing about what reached the board -- a run whose
+        # speed commands were all discarded for staleness reads identically to one
+        # the arm executed perfectly. `dropped` is cumulative; diff it across ticks.
+        s = self.bus.stats()
+        entry["link"] = {
+            "backlog": s["backlog"],
+            "dropped": s["dropped"],
+            "sent": s["sent"],
+            "latency_ms": round(s["latency_mean"] * 1000, 1),
+        }
+        entry.update(self._extra_log_fields())
         self._log_file.write(json.dumps(entry) + "\n")
 
     def _toggle_record(self):
@@ -622,8 +861,21 @@ class DeployApp(RobotAppBase):
 
     def _open_results(self):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._result_dir = os.path.join(REPO_DIR, "results", f"deploy_{stamp}")
-        os.makedirs(self._result_dir, exist_ok=True)
+        # Claimed rather than assumed: the name has one-second resolution, so two
+        # sessions recording within the same second used to land in one directory
+        # and the second's open(..., "w") truncated the first's actions.jsonl --
+        # losing a run that was still being written, silently. exist_ok=False makes
+        # the collision a failure to claim, and the suffix resolves it.
+        base = os.path.join(REPO_DIR, "results", f"deploy_{stamp}")
+        self._result_dir = base
+        for attempt in range(2, 100):
+            try:
+                os.makedirs(self._result_dir, exist_ok=False)
+                break
+            except FileExistsError:
+                self._result_dir = f"{base}_{attempt}"
+        else:
+            raise RuntimeError(f"could not claim a results directory beside {base}")
         h, w = self.image_size
         self._writer = cv2.VideoWriter(
             os.path.join(self._result_dir, "video.mp4"),
@@ -631,17 +883,7 @@ class DeployApp(RobotAppBase):
         )
         self._log_file = open(os.path.join(self._result_dir, "actions.jsonl"), "w")
         with open(os.path.join(self._result_dir, "run.json"), "w") as f:
-            json.dump({
-                "checkpoint": self.args.checkpoint,
-                "task": self.task_var.get().strip(),
-                "fps": self.args.fps,
-                "action_mode": "snap" if self._snap_var.get() else "raw",
-                "policy_type": self.runner.policy_type if self.runner else None,
-                "device": self.runner.device if self.runner else None,
-                "image_size": list(self.image_size),
-                "git_sha": git_sha(),
-                "started": stamp,
-            }, f, indent=2)
+            json.dump({**self._run_metadata(), "started": stamp}, f, indent=2)
         self._recording = True
         self._log(f"Recording to {os.path.relpath(self._result_dir, REPO_DIR)}", level="connected")
 
@@ -690,8 +932,13 @@ class DeployApp(RobotAppBase):
             for spine in ax.spines.values():
                 spine.set_color(PALETTE["border"])
             ax.grid(True, alpha=0.15)
-            self._lines.append(ax.plot([], [], lw=1.2)[0])
-        self.axes[-1].set_xlabel("tick", fontsize=7, color=PALETTE["muted"])
+            # A command holds until the next one supersedes it -- the arm is not
+            # interpolating between them -- so steps are what actually happened
+            # and a straight line between two samples would be an invention.
+            self._lines.append(ax.plot([], [], lw=1.2, drawstyle="steps-post")[0])
+        self.axes[-1].set_xlabel("seconds (0 = now)", fontsize=7, color=PALETTE["muted"])
+        # Fixed: the window is a duration, and the trace scrolls through it.
+        self.axes[-1].set_xlim(-PLOT_WINDOW_S, 0.0)
         self.figure.tight_layout(pad=0.6)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_body)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -716,11 +963,24 @@ class DeployApp(RobotAppBase):
         # Drawing a collapsed figure is pure waste on the thread that runs control.
         if not self._plot_expanded or not self._history:
             return
-        data = np.stack(self._history)
-        x = np.arange(len(data))
+        now = time.time()
+        # Trimming belongs here, not only on append: with the arm holding still
+        # nothing is appended, and the window has to keep scrolling anyway. One
+        # sample older than the left edge is kept, since it is the value the
+        # trace carries into the window.
+        while len(self._history) > 1 and self._history[1][0] < now - PLOT_WINDOW_S:
+            self._history.popleft()
+        x = np.fromiter((t - now for t, _ in self._history), dtype=np.float64,
+                        count=len(self._history))
+        data = np.stack([a for _, a in self._history])
+        # Carry the last command to the right edge. It is still in force -- nothing
+        # has superseded it -- so a trace that stopped short would read as if the
+        # arm had stopped being commanded at all.
+        x = np.append(x, 0.0)
+        data = np.vstack([data, data[-1]])
         for j, line in enumerate(self._lines):
             line.set_data(x, data[:, j])
-        self.axes[-1].set_xlim(0, max(PLOT_WINDOW, len(data)))
+        self._draw_extra_plots(now)
         self.canvas.draw_idle()
 
     # -- camera feed -------------------------------------------------------
@@ -737,8 +997,8 @@ class DeployApp(RobotAppBase):
         self._note_camera_connected()
         frame = latest[0]
         h, w = frame.shape[:2]
-        scale = DISPLAY_MAX_WIDTH / w
-        small = cv2.resize(frame, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_AREA)
+        width = self._display_width
+        small = cv2.resize(frame, (width, int(h * (width / w))), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         label = "policy" if self._policy_running else "manual"
         cv2.putText(rgb, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -750,7 +1010,7 @@ class DeployApp(RobotAppBase):
     def _show_camera_placeholder(self):
         canvas = camera_source.placeholder_frame(
             self.image_size, self.camera, self._camera_source,
-            self.args.remote_camera_port, DISPLAY_MAX_WIDTH,
+            self.args.remote_camera_port, self._display_width,
         )
         photo = ImageTk.PhotoImage(Image.fromarray(canvas))
         self.camera_label.configure(image=photo)

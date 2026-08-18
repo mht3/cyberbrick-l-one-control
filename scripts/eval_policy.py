@@ -53,9 +53,9 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.constants import ACTION
 
+from lone_data.checkpoints import default_root, same_dataset, training_dataset
 from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_NAMES
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 SPANS = np.array([hi - lo for lo, hi in ACTION_COMMAND_LIMITS], dtype=np.float64)
 
 
@@ -64,8 +64,9 @@ def parse_args():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--checkpoint", required=True, help="a checkpoint's pretrained_model/ directory")
-    p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="dataset repo id")
+    p.add_argument("--root", default=None,
+                   help="dataset directory (default: data/lerobot/<repo-id>)")
+    p.add_argument("--repo-id", required=True, help="dataset repo id") # e.g. lone/l_one_marker_pickup
     p.add_argument("--episodes", default=None, help="comma-separated episode indices (default: all)")
     p.add_argument("--max-frames", type=int, default=200, help="cap on frames scored")
     p.add_argument("--repeats", type=int, default=8,
@@ -74,7 +75,31 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--json", default=None, help="also write results to this path")
-    return p.parse_args()
+    args = p.parse_args()
+    # LeRobotDataset loads from `root` and treats `repo_id` as a label when the
+    # data is local, so a --root left at some other dataset's default is read
+    # without complaint and scores the checkpoint against episodes it never saw.
+    # Deriving it from --repo-id removes the chance for the two to disagree.
+    if args.root is None:
+        args.root = default_root(args.repo_id)
+    return args
+
+
+def warn_if_not_training_dataset(checkpoint, root):
+    """Say so when the dataset being scored is not the one the checkpoint trained on.
+
+    Not an error -- scoring against held-out data is a legitimate thing to do --
+    but it changes what the numbers mean completely, and the two cases look
+    identical in the output otherwise.
+    """
+    trained_repo_id, trained_root = training_dataset(checkpoint)
+    if trained_root is None:
+        return
+    if same_dataset(trained_root, root):
+        return
+    print(f"\nNOTE: this checkpoint trained on {trained_repo_id} ({trained_root}),")
+    print(f"      but is being scored against {root}.")
+    print("      These numbers measure generalization, not fit to the training data.")
 
 
 def load_policy(checkpoint, device):
@@ -138,8 +163,10 @@ def main():
 
     print(f"checkpoint  {args.checkpoint}")
     print(f"policy      {cfg.type}   chunk {horizon}   device {args.device}")
-    print(f"dataset     {args.repo_id}  {len(ds)} frames, scoring {n}")
+    print(f"dataset     {args.repo_id}  {args.root}")
+    print(f"            {ds0.meta.total_episodes} episodes, {len(ds)} frames, scoring {n}")
     print("\nTeacher-forced open-loop evaluation: fit to demonstrations, NOT task success.")
+    warn_if_not_training_dataset(args.checkpoint, args.root)
 
     pred_first, true_first, chunk_se, kept = [], [], [], 0
     for i in indices:

@@ -77,6 +77,8 @@ pytest tests/
 - [`collect_data.py`](collect_data.py) -- teleop GUI that records demonstrations into a LeRobotDataset.
 - [`lone_data/`](lone_data/) -- dataset schema ([`features.py`](lone_data/features.py)), the LeRobot writer ([`lerobot_recorder.py`](lone_data/lerobot_recorder.py)), camera capture, the command bus that keeps robot I/O off the record loop, and action dispatch ([`dispatch.py`](lone_data/dispatch.py)).
 - [`deploy_policy.py`](deploy_policy.py) -- GUI that runs a trained checkpoint on the arm and logs video and actions to `results/`.
+
+- [`deploy_policy_training_data_replay.py`](deploy_policy_training_data_replay.py) -- the same GUI with the camera replaced by a recorded episode, for checking whether a checkpoint reproduces its own demonstration on the real arm.
 - [`scripts/`](scripts/) -- `train.py`, `eval_policy.py`, `fix_action_stats.py`, `add_state_column.py`, `inspect_dataset.py`, `validate_dataset.py`, `test_policy_pipeline.py`.
 
 Both `LOneGripper/` and `LOneRC/` share a `bbl/` module (buzzer, motors, servos, LEDs, sleep) and an `app/` folder (`control`, `devices`, `parser`, `rc_main`) that build on [CyberBrick's `CyberBrick_Controller_Core`](https://github.com/CyberBrick-Official/CyberBrick_Controller_Core) firmware -- `bbl/` is used as-is from core, while `boot.py`/`rc_main.py` extend core's versions with WiFi-fallback behavior. See [`LICENSE`](LICENSE) -- code derived from core carries CyberBrick's own license terms in addition to this repo's.
@@ -309,12 +311,22 @@ that would be genuinely useful zero-shot is not available through it.
 ### Evaluating a checkpoint
 
 ```sh
-python scripts/eval_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model
+python scripts/eval_policy.py \
+  --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
+  --repo-id lone/l_one_marker_pickup
 ```
 
 Scores a checkpoint against the recorded demonstrations without touching hardware. It loads the
 checkpoint the same way deployment does, so the normalization statistics frozen in at training
 time are the ones used -- never recomputed from the dataset.
+
+**`--root` defaults to `data/lerobot/<repo-id>`, and is worth knowing about**, because
+`LeRobotDataset` loads from `root` and treats `repo_id` as a label once the data is local. A
+`--root` left pointing at some other dataset is read without complaint, and the checkpoint gets
+scored against episodes it has never seen while the output looks completely normal -- a fit that
+beats baseline sixfold reads as *worse than predicting the mean*. The script now derives `root`
+from `--repo-id` unless you override it, and says so when the dataset being scored is not the
+one `train_config.json` says the checkpoint trained on.
 
 **This is teacher-forced open-loop evaluation.** Every prediction is made from a *recorded*
 frame and the policy's own actions are never fed back, so it measures fit to the
@@ -344,10 +356,32 @@ be almost entirely dim 0. `--json <path>` writes the same figures machine-readab
 python deploy_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model
 ```
 
-A GUI in the same shape as `collect_data.py`: connect over Serial or WiFi, pick a checkpoint
-folder, confirm the task prompt, and run. The prompt is prefilled by following the checkpoint's
-`train_config.json` to its dataset and reading the task back out of the metadata -- π0.5
-conditions on that text, so a differently worded prompt is a different conditioning.
+A GUI in the same shape as `collect_data.py`: connect over Serial or WiFi, confirm the task
+prompt, and run. The prompt is prefilled by following the checkpoint's `train_config.json` to
+its dataset and reading the task back out of the metadata -- π0.5 conditions on that text, so a
+differently worded prompt is a different conditioning. A multi-task dataset prefills nothing,
+since no single one of its prompts is the right default; type the one you want, verbatim.
+
+**The checkpoint loads once, at startup.** π0.5 takes ~70 s to reach the GPU, so loading it on
+the Start Policy click would freeze the window at the moment the arm was about to move, and pay
+that cost again on every run. It loads on a worker thread while the GUI comes up instead --
+Start Policy stays disabled until the log says `Checkpoint ready` -- and the loaded weights then
+outlive every rollout. Only the task prompt and the action queue are per-run, so retyping the
+prompt and starting again is immediate. Stopping clears the queue and the last frame, so a run
+never begins on the previous one's actions.
+
+**Commands are sent on change, not every tick.** The board holds a command until it is
+superseded, so re-sending an identical one buys nothing and costs a full round trip -- measured
+at 73/378/1116 ms min/avg/max on the routed campus path. Dispatching all four dimensions every
+tick is 100 commands/s at 25 Hz, which no WiFi path here can drain: the queue then sits
+permanently past `_MAX_COMMAND_AGE`, every droppable *speed* is discarded for being stale, and
+the non-droppable stops still go through. The arm receives the stops and almost none of the
+motion, while the log shows a perfect trajectory, because the log records what was submitted.
+On the one recorded episode in `data/lerobot/lone/l_one` this is the difference between 1624
+commands and 22 -- and 22 is also what teleop sent while recording it, since a key press emits
+one command and a hold emits none. `RobotAppBase._wifi_heartbeat_tick` re-sends whatever speed
+is still held, which is what feeds `wifi_bridge.py`'s single global 2.0 s `COMMAND_DEADMAN_TIMEOUT`
+and what makes speeds safe to mark droppable in the first place.
 
 **Action mode.** The policy emits continuous values, but the demonstrations only ever contained
 three discrete levels per channel. *Snap to demonstrated levels* (default) quantizes back onto
@@ -363,17 +397,120 @@ readout shows measured latency against that budget so the margin is visible rath
 inferred. If the queue empties, the last action is held for up to 3 ticks to ride out jitter and
 then the arm is stopped; it never keeps driving on stale commands.
 
+A run's first tick is exempt. The frame that triggers the first inference is submitted on that
+tick, so the queue is necessarily empty when it is first read — every run used to open by
+reporting an underrun and stopping an already-stopped arm, which trained you to ignore the one
+message that matters. Until the first chunk lands the status reads *Policy priming*, nothing is
+dispatched, and the arm stays where teleop left it; if that takes more than 2 s the log says so.
+After that, an underrun message is always real.
+
+**The action plots are on a wall-clock axis** — the last 8 seconds, 0 at the right edge —
+because actions do not arrive on a regular grid. Manual control emits one per keypress and
+nothing while the arm is still, and the policy skips ticks on an underrun, so plotting against
+sample index drew a stalled minute and a busy second at the same width. The traces are drawn as
+steps and carry the last command to the present edge, which is what the arm is actually doing:
+a command holds until the next one supersedes it, and nothing interpolates between them.
+
 Every run writes `results/deploy_<timestamp>/` (gitignored):
 
 ```
 video.mp4      frames exactly as they were given to the policy
-actions.jsonl  per tick: raw prediction, dispatched action, inference latency, underrun flag
+actions.jsonl  per tick: raw prediction, dispatched action, inference latency, underrun flag,
+               and `link` -- the CommandBus's backlog, cumulative dropped count, and mean
+               latency, so the log says whether a command reached the board and not just
+               that it was submitted
 run.json       checkpoint, task, fps, action mode, device, git SHA
 ```
 
 **STOP ALL** and `<space>` stop the arm at any time. A stop also fires on Stop, on window close,
 on link death, and from a `finally` around the main loop, each preceded by `cancel_pending()` so
 a queued speed cannot land after it.
+
+### Replaying training data through the policy
+
+```sh
+python deploy_policy_training_data_replay.py \
+  --checkpoint outputs/train/2026-08-13/16-34-56_pi05/checkpoints/last/pretrained_model \
+  --repo-id lone/l_one --root data/lerobot/lone/l_one --remote-camera
+```
+
+`deploy_policy.py` with the camera swapped for a recorded episode. It subclasses `DeployApp`
+rather than copying it, so the checkpoint loading, action queue, snapping, `dispatch_action()`
+and results logging it exercises are the ones that run on the arm for real.
+
+It asks the easiest question that can be asked of a checkpoint: fed back the exact frames it
+trained on, does the arm reproduce that trajectory and pick the thing up? A policy that cannot
+imitate its own demonstration under its own training inputs has a problem in the inference and
+dispatch path, and no amount of watching a live camera separates that from a generalization
+failure. `scripts/eval_policy.py` answers the offline half of this; this answers the half with a
+motor in it.
+
+**Run it in this order.** The three runs isolate different failures, and taking them out of
+order wastes the information:
+
+1. **`Source = Dataset`.** Dispatches the *recorded* actions, with no policy in the loop, at the
+   same tick rate through the same bus. If the arm cannot pick the marker up from the
+   demonstration's own actions, the fault is start pose, timing or hardware -- stop here,
+   because nothing about the checkpoint is being measured yet. Needs no checkpoint at all.
+2. **`Source = Policy`, `--lookahead 0`.** What deployment actually does.
+3. **`Source = Policy`, `--lookahead 10`.** The same run with the inference lag dialled out.
+
+**Lag is measured, not assumed.** Every action carries the index of the frame it was predicted
+from, so the log says exactly how stale each command was. Expect roughly `n_action_steps`: the
+worker refills whenever the queue drops below a full chunk, so the queue settles near full and
+an action reaches the arm about a chunk after the frame that produced it -- 400 ms at 25 Hz.
+On a canned feed that makes the arm execute a *lagged* copy of the demonstration, which is its
+own kind of failure and worth being able to see separately. `--lookahead K` submits frame
+`cursor+K` while the panes, plots and recorded video still follow the cursor.
+
+**Ground truth is on screen and in the numbers.** The action plots carry a dashed
+*demonstration* trace beside the commanded one, and the status line shows a running match rate
+-- the fraction of dimension-ticks where the dispatched action equalled the recorded one.
+Under *Snap to demonstrated levels* both sides are on the same discrete grid, so exact agreement
+is meaningful; in raw mode nothing matches exactly and the normalized MSE beside it is the
+number to read. Both, plus mean and max lag, are appended to `actions.jsonl` as a
+`run_summary` line when a run ends.
+
+**The observation path is checked at startup.** Dataset frames reach the policy through
+`deploy_policy.py`'s unmodified camera path -- uint8 BGR, `resize_keep_aspect`, `/255`, CHW --
+and the log reports the max absolute difference against the tensor LeRobot itself returns.
+It is `0.0` when the stored frame size equals `--image-width/height`, which is the case for
+these datasets. Ruling out that class of silent preprocessing mismatch is most of the point.
+
+**Feed perturbation is how you find out why a live camera does worse.** Contrast, brightness,
+Gaussian noise and JPEG quality (75–100 in steps of 5, behind a checkbox — 75 is a real quality,
+not "off"), adjustable while the arm is running, applied to the dataset frame before the deploy
+path — so the pane, the recorded video and the policy all see the degraded image, with the
+demonstration's own actions still underneath as the control. The readout gives the mean absolute
+pixel change in 0–255 units, which is what puts the input change on a comparable scale to the
+action change it produces.
+
+The panel is collapsed by default, since a clean feed is the normal case, but **the header always
+carries the current setting** — `▶ Feed perturbation · noise σ=5.0 · JPEG q80`. A run quietly
+poisoned by noise left on from the previous one is exactly what a hidden panel would otherwise
+cause.
+
+These are not decorations. Training and the replay both see **AV1**-decoded pixels
+(`meta/info.json`); a live camera skips that round trip entirely, `--remote-camera` adds JPEG q80
+on top ([stream_camera.py](stream_camera.py)), and the room's lighting has moved since the
+episode was recorded. Measured against the single-episode π0.5 checkpoint, a **0.3% mean pixel
+change flipped the commanded action** — moving the prediction 42× further than the policy's own
+flow-matching noise, from *drive the lower arm* to *stop*. Turn the dial up until the arm stops
+doing the task; how far you got is the number worth having. `--brightness`, `--contrast`,
+`--noise` and `--jpeg-quality` set the same knobs from the command line, and the settings land in
+`run.json` and in every tick of `actions.jsonl`.
+
+**`--repo-id` is required and `--root` follows it** (`data/lerobot/<repo-id>` unless you override
+it), for the reason described under *Evaluating a checkpoint*: two independent defaults let you
+name one dataset and replay another in silence. The log also says so when the episode you are
+replaying is not the one `train_config.json` says the checkpoint trained on.
+
+**The live camera sits directly above the demo frame**, same scene at the same scale, so the
+difference between them is the only thing that draws the eye. None of this means anything unless
+the arm starts where the demonstration started: scrub to frame 0 and teleoperate the real arm
+until the two panes agree before pressing Start. `--no-camera` drops the pane. `--loop`,
+`--start-frame` and `--episode` do what they say; the episode dropdown and frame slider are the
+same controls while stopped.
 
 ### Versions
 

@@ -25,7 +25,10 @@ dependencies = [
 dev = ["pytest", "ipykernel"]
 
 [tool.setuptools]
-py-modules = ["virtual_gripper", "collect_data", "deploy_policy"]
+py-modules = [
+    "virtual_gripper", "collect_data", "deploy_policy",
+    "deploy_policy_training_data_replay",
+]
 
 [tool.setuptools.packages.find]
 include = ["lone_data*"]

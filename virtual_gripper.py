@@ -54,7 +54,15 @@ WIFI_PORT = 8266
 # is blocked for exactly that long. Keeping the connect timeout on the socket
 # afterwards is what turned a single lost reply into a 5s command blackout.
 WIFI_CONNECT_TIMEOUT = 5
-WIFI_COMMAND_TIMEOUT = 1.0
+# 2.0 to match wifi_bridge.py's COMMAND_DEADMAN_TIMEOUT, which was sized against
+# measured round-trip time on the routed campus path: 73/378/1116 ms
+# min/avg/max with 17% loss. At 1.0 the host gave up below that path's own worst
+# case, so a single slow reply raised LinkDesynced and tore down a link the board
+# still considered live -- the auto-reconnect budget then burned through three of
+# those in under ten seconds each. Anything the host waits past the board's
+# deadman is time the arm is already stopped, so there is no reason to wait longer
+# than 2.0 either: the two numbers are one decision and belong at one value.
+WIFI_COMMAND_TIMEOUT = 2.0
 
 
 class LinkDesynced(RuntimeError):

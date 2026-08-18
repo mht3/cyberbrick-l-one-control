@@ -50,31 +50,65 @@ def snap_to_levels(action):
     return out
 
 
-def dispatch_action(bus, action, channels):
-    """Queue one action on the CommandBus.
+def dispatch_action(bus, action, channels, last=None):
+    """Queue the parts of one action that differ from the last one.
 
     channels: (base_motor, upper_servo, lower_servo, gripper_servo) indices, passed
     in rather than imported so this package stays independent of virtual_gripper.
 
-    Speeds are droppable -- a later command supersedes them, and the WiFi heartbeat
-    re-sends whatever is still held. Stops are not: nothing re-sends a stop, so
-    discarding one leaves the joint driving until the board's deadman timer fires.
+    `last` is the previously dispatched action; None re-sends everything, which is
+    what a run's first tick and anything following a stop_all want.
+
+    RESENDING AN UNCHANGED COMMAND IS NOT FREE, and this is the whole reason the
+    parameter exists. Every command is a round trip the CommandBus worker has to
+    complete -- measured at 73/378/1116 ms min/avg/max on the routed campus path.
+    Dispatching all four dimensions every tick is 100 commands/s at 25 Hz, which no
+    WiFi path here can drain, so the queue runs permanently behind _MAX_COMMAND_AGE
+    and every droppable *speed* is discarded for being stale while the
+    non-droppable stops still go through. The arm then receives the stops and
+    almost none of the motion.
+
+    A demonstration is mostly repeats: the recorded episode in data/lerobot/lone/
+    l_one changes its action on 18 of 406 frames. Teleop sent those 18 commands,
+    because a key press emits one command and a hold emits none. Sending 1624
+    instead is not a more faithful replay of that data -- it is a different
+    dispatch pattern than the one the data was recorded under, and it is the one
+    that saturates the link.
+
+    The board holds a command until it is superseded, so the skipped ones change
+    nothing about what the arm is doing. What still has to be fed is
+    wifi_bridge.py's COMMAND_DEADMAN_TIMEOUT, a single global 2.0 s timer that any
+    command resets -- see RobotAppBase._wifi_heartbeat_tick, which re-sends held
+    speeds and is what makes them safe to mark droppable here.
+
+    Speeds are droppable, stops are not: nothing re-sends a stop, so discarding one
+    leaves the joint driving until that deadman fires.
     """
     action = np.asarray(action, dtype=np.float32).reshape(ACTION_DIM)
     base, upper, lower, gripper = channels
-
-    speed = float(action[0])
-    if speed == 0.0:
-        bus.submit(f"motor:{base}", "stop_motor", base)
+    if last is None:
+        changed = [True] * ACTION_DIM
     else:
-        bus.submit(f"motor:{base}", "set_motor_speed", base, int(round(speed)), droppable=True)
+        last = np.asarray(last, dtype=np.float32).reshape(ACTION_DIM)
+        changed = [bool(action[i] != last[i]) for i in range(ACTION_DIM)]
 
-    for idx, value in ((upper, float(action[1])), (lower, float(action[2]))):
+    if changed[0]:
+        speed = float(action[0])
+        if speed == 0.0:
+            bus.submit(f"motor:{base}", "stop_motor", base)
+        else:
+            bus.submit(f"motor:{base}", "set_motor_speed", base, int(round(speed)), droppable=True)
+
+    for i, idx in ((1, upper), (2, lower)):
+        if not changed[i]:
+            continue
+        value = float(action[i])
         if value == 0.0:
             bus.submit(f"servo:{idx}", "stop_servo", idx)
         else:
             bus.submit(f"servo:{idx}", "set_servo_speed", idx, int(round(value)), droppable=True)
 
-    bus.submit(
-        f"servo_angle:{gripper}", "set_servo_angle", gripper, int(round(float(action[3])))
-    )
+    if changed[3]:
+        bus.submit(
+            f"servo_angle:{gripper}", "set_servo_angle", gripper, int(round(float(action[3])))
+        )

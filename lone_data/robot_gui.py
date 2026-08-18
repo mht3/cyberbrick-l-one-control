@@ -699,22 +699,34 @@ class RobotAppBase(tk.Tk):
         self._on_emergency_stop()
         self._reset_action_state(reopen_gripper=False)
 
+    def _held_speeds(self):
+        """(base, upper, lower) speeds currently in force, for the heartbeat.
+
+        A hook because manual control is not the only thing that can be holding a
+        joint: a policy or a dataset replay dispatches on change, so what it is
+        holding lives in _current_action rather than in JointControl.
+        """
+        return (self.base_control._current, self.upper_control._current,
+                self.lower_control._current)
+
     def _wifi_heartbeat_tick(self):
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
         if not isinstance(self.link, CyberBrickWifiLink):
             return
         # Queued, not sent inline -- this used to block the main thread every 200ms.
         # These are the only commands that get re-sent on a timer, which is what
-        # makes them safe to drop when stale (see CommandBus.submit).
-        if self.base_control._current != 0:
+        # makes them safe to drop when stale (see CommandBus.submit), and what lets
+        # dispatch_action() send only what changed.
+        base, upper, lower = self._held_speeds()
+        if base:
             self.bus.submit(f"motor:{BASE_MOTOR}", "set_motor_speed", BASE_MOTOR,
-                            self.base_control._current, droppable=True)
-        if self.upper_control._current != 0:
+                            int(base), droppable=True)
+        if upper:
             self.bus.submit(f"servo:{UPPER_ARM_SERVO}", "set_servo_speed", UPPER_ARM_SERVO,
-                            self.upper_control._current, droppable=True)
-        if self.lower_control._current != 0:
+                            int(upper), droppable=True)
+        if lower:
             self.bus.submit(f"servo:{LOWER_ARM_SERVO}", "set_servo_speed", LOWER_ARM_SERVO,
-                            self.lower_control._current, droppable=True)
+                            int(lower), droppable=True)
 
     def _link_readout(self):
         """Command latency, so a degrading link is visible before an episode is
