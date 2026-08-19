@@ -162,7 +162,7 @@ fps, missed deadlines, command latency) goes to `logs/collection_*.jsonl`, outsi
 python scripts/inspect_dataset.py       # schema, action ranges, tasks, episode lengths
 python scripts/validate_dataset.py      # self-consistency checks; non-zero exit on failure
 python scripts/test_policy_pipeline.py  # what each policy makes of the dataset
-lerobot-dataset-viz --repo-id lone/l_one_marker_pickup --root data/lerobot/lone/l_one_marker_pickup
+lerobot-dataset-viz --repo-id lone/l_one_green_marker --root data/lerobot/lone/l_one_green_marker
 ```
 
 ### Normalization statistics
@@ -170,7 +170,7 @@ lerobot-dataset-viz --repo-id lone/l_one_marker_pickup --root data/lerobot/lone/
 Run this after every collection session, before training:
 
 ```sh
-python scripts/fix_action_stats.py
+python scripts/fix_action_stats.py --root data/lerobot/lone/l_one_green_marker
 ```
 
 Action statistics estimated from recorded frames are unreliable here. Teleop emits three
@@ -183,9 +183,27 @@ policy's output head expects.
 The limits are known exactly, so `ACTION_COMMAND_LIMITS` in
 [`features.py`](lone_data/features.py) declares them and the script writes them in. All four
 statistic pairs are written, since each normalization mode reads a different one --
-`mean`/`std` (ACT), `min`/`max` (Diffusion Policy), `q01`/`q99` (π0.5), `q10`/`q90`.
-Rerunning is necessary because `LeRobotDataset.save_episode()` regenerates `meta/stats.json`
-from the recorded data on every saved episode.
+`mean`/`std` (ACT), `min`/`max` (Diffusion Policy and this repo's π0.5 default), `q01`/`q99`,
+`q10`/`q90`. Rerunning is necessary because `LeRobotDataset.save_episode()` regenerates
+`meta/stats.json` from the recorded data on every saved episode.
+
+**Actions are normalized MIN_MAX, not by quantile**, which is why every training command below
+passes `--policy.normalization_mapping`. π0.5 defaults to QUANTILES, and quantiles are the wrong
+statistic for three-level commands twice over:
+
+- A level appearing in under 1% of frames sits inside the tail the quantile discards, so that
+  whole direction of the joint's range normalizes away. Levels this rare are normal here -- one
+  joint may be nudged once an episode and driven hard in the other direction throughout.
+- `aggregate_feature_stats` combines per-episode quantiles with a count-weighted mean, which is
+  not a valid operation on a quantile. The result is neither the pooled quantile nor a value any
+  action takes. `min`/`max` in the same function aggregate exactly -- `np.min` of mins, `np.max`
+  of maxes -- so they are immune.
+
+Commands are hard-clamped to known limits, so there are no outliers for a quantile to reject, and
+once the statistics are written from the envelope both modes compute identical numbers. MIN_MAX is
+simply the one that survives aggregation. It still collapses if a whole session never drives a
+joint in one direction, so `fix_action_stats.py` remains the thing that makes it correct by
+construction.
 
 ### Training
 
@@ -198,9 +216,10 @@ ACT is the cheaper baseline, needs no Hub access, and takes no `empty_cameras`:
 
 ```sh
 python scripts/train.py \
-  --dataset.repo_id=lone/l_one_marker_pickup \
-  --dataset.root=data/lerobot/lone/l_one_marker_pickup \
+  --dataset.repo_id=lone/l_one_green_marker \
+  --dataset.root=data/lerobot/lone/l_one_green_marker \
   --policy.type=act \
+  --policy.normalization_mapping='{"VISUAL":"MEAN_STD","STATE":"MEAN_STD","ACTION":"MIN_MAX"}' \
   --policy.device=cuda \
   --batch_size=8 --steps=30000
 ```
@@ -223,28 +242,91 @@ checkpoint as a wandb artifact, which for π0.5 means a multi-GB upload at each 
 `--wandb.mode=offline` logs to disk for a later `wandb sync` instead. Without wandb, metrics
 still go to the console and to `outputs/train/`.
 
-For π0.5, L-ONE has one camera and the policy takes three image slots, so two are declared
-empty. Unlike ACT it needs Hub access, for the gated PaliGemma tokenizer and the base weights:
+π0.5 declares three image slots because openpi, where it was pretrained, is JAX: the
+observation pytree must be statically shaped across jitted calls, so every robot emits all
+three keys and toggles `image_masks` to say which are real. L-ONE has one camera, and in
+PyTorch that constraint does not exist -- so the extra slots are left off
+(`--policy.empty_cameras=0`). See *Why `empty_cameras=0`* below. Unlike ACT it needs Hub
+access, for the gated PaliGemma tokenizer and the base weights:
 
 ```sh
 hf auth login   # google/paligemma-3b-pt-224 is gated; accept its licence first
 
 python scripts/train.py \
-  --dataset.repo_id=lone/l_one_marker_pickup \
-  --dataset.root=data/lerobot/lone/l_one_marker_pickup \
+  --dataset.repo_id=lone/l_one_green_marker \
+  --dataset.root=data/lerobot/lone/l_one_green_marker \
   --policy.type=pi05 \
   --policy.pretrained_path=lerobot/pi05_base \
-  --policy.empty_cameras=2 \
+  --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"QUANTILES","ACTION":"MIN_MAX"}' \
+  --policy.empty_cameras=0 \
   --policy.n_action_steps=10 \
   --policy.freeze_vision_encoder=true \
   --policy.train_expert_only=true \
-  --policy.gradient_checkpointing=true \
+  --policy.gradient_checkpointing=false \
   --policy.dtype=bfloat16 \
   --policy.device=cuda \
   --batch_size=8 --num_workers=8 \
-  --steps=30000 --save_freq=5000 \
+  --steps=150000 --policy.scheduler_decay_steps=150000 \
+  --save_freq=5000 \
   --wandb.enable=true --wandb.project=lone --wandb.disable_artifact=true
 ```
+
+`--policy.normalization_mapping` must be passed as the whole dict; draccus rejects the dotted
+`--policy.normalization_mapping.ACTION=MIN_MAX` form. `VISUAL` and `STATE` keep π0.5's own
+defaults -- images are already `[0, 1]` and `observation.state` is all zeros -- so `ACTION` is the
+only entry that changes.
+
+**Throughput.** Measured on an RTX 5090 (32 GB), one camera, `l_one_green_marker`:
+
+| config | s/step | samples/s | peak VRAM |
+|---|---:|---:|---:|
+| `empty_cameras=2`, `gradient_checkpointing=true`, bs 8 | 0.913 | 8.8 | 16.7 GB |
+| `empty_cameras=0`, `gradient_checkpointing=false`, bs 8 | **0.238** | **33.6** | 24.2 GB |
+
+3.8x, from dropping work the model discards anyway. Two things to know:
+
+* **Gradient checkpointing is a memory trade, not a speed one.** It frees activations and
+  recomputes them in the backward pass -- roughly one extra forward. The π0.5 doc turns it on
+  because those commands are `--batch_size=64` and "sized for a single 80 GB GPU". At batch 8
+  on 32 GB it costs ~1.6x for nothing. It is numerically exact (there is no dropout anywhere in
+  the π0.5 forward, so `preserve_rng_state=False` is safe).
+* **Batch size buys no throughput here.** 8 -> 16 -> 32 holds at ~7 samples/s; the GPU is
+  already saturated at batch 8. Raise it only if you want fewer, less noisy optimizer steps.
+  Above bs 12 (`empty_cameras=0`) or bs 5 (`empty_cameras=2`) it OOMs.
+
+`--policy.tokenizer_max_length` looks like a third lever and is not: whenever
+`--policy.pretrained_path` is set, `make_pre_post_processors()` deserializes the tokenizer step
+from the pretrained repo's `policy_preprocessor.json` (`max_length: 200`), and the
+`preprocessor_overrides` dict in `lerobot_train.py` has no `tokenizer_processor` entry. The flag
+lands in `train_config.json` and is never read. Setting it changes neither step time nor memory.
+
+If you change `--steps`, change `--policy.scheduler_decay_steps` with it. It defaults to 30000,
+so a longer run silently spends its tail at the floor LR.
+
+**Why `empty_cameras=0`.** `empty_cameras=N` *adds* N synthetic cameras -- it does not declare
+how many of three slots are unused. With one real camera, `=2` fabricates two all-`-1` images,
+runs SigLIP on each, and appends 512 tokens to the prefix (968 vs 456). All 512 are then masked
+out of every attention computation involving a real token. Verified as mask arithmetic, with no
+model involved:
+
+| | 3 slots vs 1 slot |
+|---|---|
+| real-to-real attention submatrix identical | true |
+| position ids of real tokens identical | true |
+| any real query attends a masked key | false |
+
+`pad_2d_masks = pad_masks[:,None,:] * pad_masks[:,:,None]` drops masked positions as both
+queries and keys, and `position_ids = cumsum(pad_masks) - 1` does not advance across them, so
+real tokens land on identical RoPE positions either way. On the pretrained `pi05_base` weights
+in fp32, the resulting change in network output is 5.8e-4 against a 7.8e-4 run-to-run noise
+floor -- i.e. below the noise of running the same config twice.
+
+This does not contradict pretraining. SigLIP is never handed three images at once; it is called
+in a Python loop, once per image, with no cross-image interaction. What has a three-slot
+structure is the token sequence fed to Gemma, and robots with fewer cameras were pretrained with
+the spare slots masked -- which is the same computation as omitting them. Corroboration: openpi
+pads with `np.zeros_like(base_image)` while lerobot pads with `-1`. Two different fill values,
+both correct, which is only possible because the pixels are never read.
 
 **Checkpoints.** `--save_freq=5000` writes a full checkpoint every 5000 steps to
 `outputs/train/<date>/<time>_pi05/checkpoints/`, plus a `last/` symlink:
@@ -260,7 +342,8 @@ checkpoints to wandb -- they are still written locally, which is the copy that m
 from one with `--resume=true --config_path=<checkpoint>/pretrained_model/train_config.json`.
 
 `--policy.pretrained_path` loads weights only and resets the checkpoint's config to defaults,
-which is why `n_action_steps`, `dtype` and `empty_cameras` are spelled out; `--policy.path`
+which is why `n_action_steps` and `dtype` are spelled out (`empty_cameras=0` is already the
+default and is passed only to make the choice explicit); `--policy.path`
 would load weights *and* the checkpoint's `config.json`. The two are not interchangeable.
 
 A correct load prints `All keys loaded successfully!`. Anything else means the checkpoint and
@@ -313,7 +396,7 @@ that would be genuinely useful zero-shot is not available through it.
 ```sh
 python scripts/eval_policy.py \
   --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
-  --repo-id lone/l_one_marker_pickup
+  --repo-id lone/l_one_green_marker
 ```
 
 Scores a checkpoint against the recorded demonstrations without touching hardware. It loads the
@@ -389,6 +472,44 @@ them, keeping the arm inside the distribution it was trained on; *raw* clamps to
 `ACTION_COMMAND_LIMITS` instead. Both the raw prediction and the dispatched action are logged
 either way, so the choice stays visible after the fact.
 
+**Real-time chunking** (`--rtc`, and a checkbox that stays live mid-run) changes how one chunk
+gives way to the next. By default a fresh chunk is appended behind whatever is still queued, so
+the arm works through an old plan -- drawn from a frame up to ~19 ticks ago -- before it sees the
+new one, and where the two meet nothing smoothed the join. That seam is the jerk. RTC is
+[Physical Intelligence's method](https://www.physicalintelligence.company/research/real_time_chunking):
+it treats the new chunk as an inpainting problem, adding a guidance term to the flow-matching
+denoiser that holds the chunk's head against the unexecuted tail of the plan already running,
+under a weight that decays across the overlap. The queue is then *replaced* rather than appended,
+with the first `ceil(latency x fps)` actions dropped as already spent -- so the arm also reaches
+the newest plan far sooner. None of it is implemented here; it is `lerobot.policies.rtc` wired to
+`PolicyRunner`, and it needs a flow-matching policy (π0, π0.5, SmolVLA) -- the checkbox greys out
+for anything else.
+
+The knobs are `--rtc-execution-horizon` (default 20; keep it well above the inference delay in
+ticks, ~4 here, or the guidance degenerates into a hard clamp with no ramp to blend over),
+`--rtc-max-guidance-weight` (10.0 suits 10 denoising steps), `--rtc-schedule`, and
+`--rtc-queue-threshold`, which is the open-loop horizon: the worker replans once the queue falls
+to that many actions.
+
+Expect to *measure* the improvement rather than see it. Snapping quantizes each channel to three
+levels, and RTC's smoothing is mostly sub-quantum -- what survives the quantizer is the timing of
+level changes, so the effect shows up as fewer commands and fewer one-tick reversals, not as
+visibly smoother motion. `raw` in `actions.jsonl` is the pre-snap value and is where the smoothing
+is actually legible; `rtc_delay` is rewritten exactly when a chunk was replaced, which is how the
+seams are found. Run in *raw* mode if you want to watch it on the plot panel, which draws the
+dispatched action. `python scripts/test_rtc.py --checkpoint <dir>` checks the whole path -- weight
+schedules, that the guidance measurably pulls the chunk head toward the prefix while leaving the
+tail free, and that the queue bookkeeping survives a live toggle in both directions.
+
+**The checkpoint's action normalization is checked at load.** Deployment expects actions
+normalized MIN_MAX against `ACTION_COMMAND_LIMITS` (see *Normalization statistics* above for why).
+Both halves are verified when the checkpoint loads: the mode is read out of
+`policy_preprocessor.json`, and the statistic pair that mode actually decodes against is compared
+to the declared limits. A mismatch is logged with the offending dimensions and where *stopped*
+decodes to. Neither failure has any other symptom -- the mapping stays invertible, so the arm just
+drives a little too far on the affected joints. The check is advisory and never blocks a load; the
+fix is to correct the dataset statistics, retrain, or both.
+
 **Why inference runs on a worker thread.** π0.5 takes ~280 ms per inference on an RTX 5090,
 which is most of a control period. It runs off the Tk thread and keeps a queue of upcoming
 actions filled; the control tick only pops and dispatches. One inference covers
@@ -416,10 +537,11 @@ Every run writes `results/deploy_<timestamp>/` (gitignored):
 ```
 video.mp4      frames exactly as they were given to the policy
 actions.jsonl  per tick: raw prediction, dispatched action, inference latency, underrun flag,
+               `rtc`/`rtc_delay`/`rtc_prefix` (per tick, because the checkbox is live),
                and `link` -- the CommandBus's backlog, cumulative dropped count, and mean
                latency, so the log says whether a command reached the board and not just
                that it was submitted
-run.json       checkpoint, task, fps, action mode, device, git SHA
+run.json       checkpoint, task, fps, action mode, RTC settings, device, git SHA
 ```
 
 **STOP ALL** and `<space>` stop the arm at any time. A stop also fires on Stop, on window close,
@@ -430,8 +552,8 @@ a queued speed cannot land after it.
 
 ```sh
 python deploy_policy_training_data_replay.py \
-  --checkpoint outputs/train/2026-08-13/16-34-56_pi05/checkpoints/last/pretrained_model \
-  --repo-id lone/l_one --root data/lerobot/lone/l_one --remote-camera
+  --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
+  --repo-id lone/l_one_green_marker --root data/lerobot/lone/l_one_green_marker --remote-camera
 ```
 
 `deploy_policy.py` with the camera swapped for a recorded episode. It subclasses `DeployApp`

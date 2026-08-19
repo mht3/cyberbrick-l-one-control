@@ -25,11 +25,24 @@ The policy emits continuous values, but the demonstrations only ever contained
 three discrete levels per channel. "Snap" quantizes back onto them (default, and
 closest to how the arm was actually driven); "raw" clamps to the command limits.
 Both are logged either way, so the choice stays visible after the fact.
+
+Real-time chunking (--rtc, and the checkbox) changes how one chunk gives way to
+the next. By default a fresh chunk is appended behind whatever is still queued, so
+the arm finishes an old plan drawn from a frame up to ~19 ticks ago before it sees
+the new one, and the two plans meet at a seam nothing smoothed. With RTC the
+denoiser is guided so the head of the new chunk agrees with the unexecuted tail of
+the old one, and the queue is *replaced* rather than appended -- both a smoother
+join and a much fresher plan. Note that snapping quantizes away most of the
+smoothing: what survives is the timing of level changes, so the effect shows up as
+fewer commands and fewer one-tick reversals rather than as visibly smoother
+motion. The pre-snap values are logged as `raw` on every tick, which is where to
+look for it.
 """
 
 import argparse
 import datetime
 import json
+import math
 import os
 import signal
 import subprocess
@@ -103,6 +116,29 @@ def build_parser(description=__doc__):
     p.add_argument("--device", default=None)
     p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1])
     p.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_SIZE[0])
+
+    # Real-time chunking. Implemented in lerobot (lerobot.policies.rtc) and
+    # supported by pi0.5; these only choose whether and how to switch it on. The
+    # schedule stays a string here because build_parser() runs at import time and
+    # every lerobot import in this file is deferred into PolicyRunner -- it
+    # becomes an RTCAttentionSchedule there. Constrain it with choices=: an
+    # unrecognized name raises UnboundLocalError from inside the denoiser.
+    rtc = p.add_argument_group("real-time chunking")
+    rtc.add_argument("--rtc", action="store_true",
+                     help="guide each chunk to agree with the tail of the one it replaces "
+                          "(flow-matching policies only -- pi0/pi0.5/SmolVLA)")
+    rtc.add_argument("--rtc-execution-horizon", type=int, default=20,
+                     help="ticks of the previous chunk the new one is guided against. Must "
+                          "stay above the inference delay in ticks (~7 at 25fps) or the "
+                          "guidance degenerates into a hard clamp with no ramp")
+    rtc.add_argument("--rtc-max-guidance-weight", type=float, default=10.0,
+                     help="how hard to enforce agreement; 10.0 suits 10 denoising steps")
+    rtc.add_argument("--rtc-schedule", choices=("ZEROS", "ONES", "LINEAR", "EXP"),
+                     default="LINEAR", help="how the agreement weight decays across the overlap")
+    rtc.add_argument("--rtc-queue-threshold", type=int, default=30,
+                     help="re-infer once the queue falls to this many actions. This is the "
+                          "open-loop horizon: at or above chunk_size the worker replans "
+                          "continuously")
     return p
 
 
@@ -136,6 +172,103 @@ def checkpoint_task(checkpoint):
     return tasks[0] if len(tasks) == 1 else ""
 
 
+def rtc_settings(args):
+    """The real-time chunking arguments as a plain dict.
+
+    PolicyRunner takes this rather than the argparse namespace so it stays
+    constructible from a test harness, and so the lerobot types the settings turn
+    into stay behind the deferred import.
+    """
+    return {
+        "enabled": bool(getattr(args, "rtc", False)),
+        "execution_horizon": int(getattr(args, "rtc_execution_horizon", 20)),
+        "max_guidance_weight": float(getattr(args, "rtc_max_guidance_weight", 10.0)),
+        "schedule": str(getattr(args, "rtc_schedule", "LINEAR")),
+        "queue_threshold": int(getattr(args, "rtc_queue_threshold", 30)),
+    }
+
+
+# The statistic pair each normalization mode decodes against, per
+# lerobot/processor/normalize_processor.py. MEAN_STD is absent on purpose:
+# mean/std make no claim about an envelope, so there is nothing to check.
+NORM_STAT_PAIR = {
+    "MIN_MAX": ("min", "max"),
+    "QUANTILES": ("q01", "q99"),
+    "QUANTILE10": ("q10", "q90"),
+}
+EXPECTED_NORM_MODE = "MIN_MAX"
+
+
+def action_stats_warning(checkpoint):
+    """Why this checkpoint's action decoding is not what deployment expects, or None.
+
+    Actions are normalized MIN_MAX against ACTION_COMMAND_LIMITS -- see the
+    Normalization statistics section of the README for why quantiles are the wrong
+    statistic for three-level commands. Both halves of that are checked here,
+    because both fail silently: the mapping stays invertible either way, and the
+    only symptom is an arm that drives a little too far on the affected joints.
+
+    Advisory only. Never blocks a load.
+    """
+    try:
+        import glob
+
+        from safetensors.torch import load_file
+
+        matches = glob.glob(os.path.join(checkpoint, "*normalizer_processor.safetensors"))
+        if not matches:
+            return None
+        # Read the mode off the saved pipeline rather than assuming it. Checking
+        # the wrong pair is worse than not checking: a MIN_MAX checkpoint can
+        # carry skewed quantiles and still be correct, because nothing reads them.
+        mode = None
+        with open(os.path.join(checkpoint, "policy_preprocessor.json")) as f:
+            for step in json.load(f).get("steps", []):
+                norm_map = step.get("config", {}).get("norm_map") or {}
+                if "ACTION" in norm_map:
+                    mode = norm_map["ACTION"]
+        if mode is None:
+            return None
+        stats = load_file(matches[0])
+    except Exception:
+        return None
+
+    problems = []
+    if mode != EXPECTED_NORM_MODE:
+        problems.append(
+            f"actions are normalized {mode}, not {EXPECTED_NORM_MODE} -- retrain with "
+            f"--policy.normalization_mapping='{{...,\"ACTION\":\"{EXPECTED_NORM_MODE}\"}}'"
+        )
+
+    if mode in NORM_STAT_PAIR:
+        lo_key, hi_key = NORM_STAT_PAIR[mode]
+        try:
+            low = stats[f"action.{lo_key}"].flatten().tolist()
+            high = stats[f"action.{hi_key}"].flatten().tolist()
+        except KeyError:
+            return "; ".join(problems) or None
+        skewed = []
+        for i, name in enumerate(ACTION_NAMES):
+            lo, hi = ACTION_COMMAND_LIMITS[i]
+            # Both ends within a percent of the declared envelope is the intended state.
+            if abs(low[i] - lo) > abs(hi - lo) * 0.01 or abs(high[i] - hi) > abs(hi - lo) * 0.01:
+                span = high[i] - low[i]
+                at_zero = 2 * (0.0 - low[i]) / span - 1 if span else 0.0
+                skewed.append(f"{name} {lo_key}/{hi_key} {low[i]:.0f}/{high[i]:.0f} vs limits "
+                              f"{lo:.0f}/{hi:.0f} (stopped decodes at {at_zero:+.2f}, not 0)")
+        if skewed:
+            problems.append(
+                f"{lo_key}/{hi_key} does not span the command limits on {len(skewed)} of "
+                f"{len(ACTION_NAMES)} dimensions, so those joints drive off-center: "
+                + "; ".join(skewed)
+                + " -- rerun scripts/fix_action_stats.py on the training dataset"
+            )
+
+    if not problems:
+        return None
+    return "Action normalization: " + ". ".join(problems) + "."
+
+
 def validate_checkpoint(path):
     """Reason `path` is not a usable checkpoint directory, or None."""
     if not path:
@@ -160,7 +293,7 @@ class PolicyRunner:
     loaded twice.
     """
 
-    def __init__(self, checkpoint, device=None, n_action_steps=None):
+    def __init__(self, checkpoint, device=None, n_action_steps=None, fps=25, rtc=None):
         import torch
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
@@ -168,6 +301,7 @@ class PolicyRunner:
         self.torch = torch
         self.checkpoint = checkpoint
         self.task = ""
+        self.fps = int(fps) or 25
 
         cfg = PreTrainedConfig.from_pretrained(checkpoint)
         if device:
@@ -178,8 +312,22 @@ class PolicyRunner:
         self.policy.eval().to(self.device)
         self.pre, self.post = make_pre_post_processors(policy_cfg=cfg, pretrained_path=checkpoint)
         self.n_action_steps = int(n_action_steps or getattr(cfg, "n_action_steps", 1) or 1)
+        # Read here rather than on the Tk thread; surfaced by the caller once the
+        # load lands, so it appears in the log next to "Checkpoint ready".
+        self.stats_warning = action_stats_warning(checkpoint)
+        self._configure_rtc(rtc)
 
         self._pending = deque()
+        # The chunk _pending was derived from, before the postprocessor and still
+        # on the policy's device -- the space RTC's prefix has to be expressed in.
+        # _consumed indexes into it, so the invariant every merge must preserve is
+        #     len(_pending) == len(_chunk_raw) - _consumed
+        # and _pending[i] is _chunk_raw[_consumed + i], post-processed. Track the
+        # index explicitly rather than deriving it from len(_pending): the two
+        # diverge as soon as the queue is appended to rather than replaced, and a
+        # wrong offset is a silent slice off the wrong end, not an error.
+        self._chunk_raw = None
+        self._consumed = 0
         self._lock = threading.Lock()
         self._frame = None
         # Caller-supplied label for the frame currently staged for inference. Every
@@ -195,6 +343,39 @@ class PolicyRunner:
         self._generation = 0
         self.last_latency = None
         self.error = None
+        # Last merge's shape, for the status line and the per-tick log.
+        self.last_rtc_delay = None
+        self.last_rtc_prefix = None
+
+    def _configure_rtc(self, rtc):
+        """Attach an RTCConfig to the loaded policy, if it can use one.
+
+        lerobot builds the processor from policy.config.rtc_config, and reads
+        .enabled fresh on every inference -- so this runs once at load and the
+        checkbox only has to flip a bool afterwards. It must be policy.config and
+        not the cfg above: from_pretrained() loads a config object of its own, and
+        assigning to the wrong one is a silent no-op.
+        """
+        supports = getattr(self.policy, "supports_rtc", None)
+        self.supports_rtc = bool(callable(supports) and supports())
+        self.rtc_config = None
+        self.rtc_enabled = False
+        self.rtc_execution_horizon = int((rtc or {}).get("execution_horizon", 20))
+        self.rtc_queue_threshold = int((rtc or {}).get("queue_threshold", 30))
+        if not self.supports_rtc or rtc is None:
+            return
+        from lerobot.configs import RTCAttentionSchedule
+        from lerobot.policies.rtc import RTCConfig
+
+        self.rtc_config = RTCConfig(
+            enabled=bool(rtc["enabled"]),
+            prefix_attention_schedule=RTCAttentionSchedule(rtc["schedule"]),
+            max_guidance_weight=float(rtc["max_guidance_weight"]),
+            execution_horizon=self.rtc_execution_horizon,
+        )
+        self.policy.config.rtc_config = self.rtc_config
+        self.policy.init_rtc_processor()
+        self.rtc_enabled = bool(rtc["enabled"])
 
     def start(self, task):
         """Serve actions for `task`, from a clean queue. Reusable across runs."""
@@ -217,9 +398,15 @@ class PolicyRunner:
         with self._lock:
             # Actions predicted from the old run's frames must not survive into
             # the next one, and a stale frame must not seed its first inference.
+            # The chunk mirror goes with them: guiding a new run's first chunk
+            # toward the previous run's plan is exactly what it must not do.
             self._pending.clear()
+            self._chunk_raw = None
+            self._consumed = 0
             self._frame = None
             self._frame_meta = None
+            self.last_rtc_delay = None
+            self.last_rtc_prefix = None
 
     def submit_frame(self, rgb, meta=None):
         with self._lock:
@@ -234,7 +421,12 @@ class PolicyRunner:
         training-data replay.
         """
         with self._lock:
-            return self._pending.popleft() if self._pending else None
+            if not self._pending:
+                return None
+            # The one place an action leaves the queue, so the one place the RTC
+            # prefix's start index may move.
+            self._consumed += 1
+            return self._pending.popleft()
 
     @property
     def queued(self):
@@ -261,28 +453,95 @@ class PolicyRunner:
         }
 
     def _run(self, generation):
+        from lerobot.policies.rtc import LatencyTracker
+
+        # Per-run, so one run's hiccup cannot inflate the next run's delay estimate.
+        tracker = LatencyTracker(maxlen=50)
         while self._running and generation == self._generation:
+            # Snapshot once per cycle. The worker is the only writer of
+            # rtc_config.enabled, and lerobot reads it once per inference, so a
+            # click mid-cycle cannot leave the guidance and the merge disagreeing
+            # about which mode this chunk was drawn in.
+            rtc_on = bool(self.rtc_config is not None and self.rtc_enabled)
             with self._lock:
-                need = len(self._pending) < self.n_action_steps
+                need = (len(self._pending) <= self.rtc_queue_threshold if rtc_on
+                        else len(self._pending) < self.n_action_steps)
                 frame, meta = self._frame, self._frame_meta
             if not need or frame is None:
                 time.sleep(0.005)
                 continue
             try:
+                # Timed from here, not from the model call: what the delay has to
+                # measure is how much of the world moved on between this frame and
+                # these actions reaching the queue, and tokenizing a 200-token
+                # prompt is part of that.
                 started = time.perf_counter()
                 batch = {
                     k: (v.unsqueeze(0) if self.torch.is_tensor(v) else [v])
                     for k, v in self._observation(frame).items()
                 }
+                prepared = self.pre(batch)
+
+                # Read after preprocessing, not before: tokenizing is milliseconds,
+                # but a prefix read ahead of it can have had its first row
+                # dispatched in the meantime, which shifts the whole alignment.
+                kwargs, prefix = {}, None
+                with self._lock:
+                    if self.rtc_config is not None:
+                        self.rtc_config.enabled = rtc_on
+                    if rtc_on and self._chunk_raw is not None:
+                        prefix = self._chunk_raw[
+                            self._consumed:self._consumed + self.rtc_execution_horizon
+                        ].clone()
+                    if prefix is not None and len(prefix):
+                        # p95, not max(): LatencyTracker.max_latency is a lifetime
+                        # high-water mark that ignores the window, so one slow
+                        # inference would pin the delay forever -- and a delay at
+                        # or past the horizon flattens the schedule into a hard
+                        # clamp with no ramp left to blend over.
+                        delay = min(int(math.ceil(tracker.p95() * self.fps)),
+                                    self.rtc_execution_horizon)
+                        kwargs = {"inference_delay": delay, "prev_chunk_left_over": prefix}
+                    else:
+                        prefix = None
+
+                # no_grad, never inference_mode: RTC re-enables grad inside the
+                # denoiser and needs to set requires_grad on the latent, which
+                # inference_mode forbids.
                 with self.torch.no_grad():
-                    chunk = self.policy.predict_action_chunk(self.pre(batch))
+                    chunk = self.policy.predict_action_chunk(prepared, **kwargs)
+                original = chunk[0].detach().clone()  # pre-postprocessor, on device
                 actions = self.post(chunk)[0].float().cpu().numpy()
                 latency = time.perf_counter() - started
+                tracker.add(latency)
+
                 with self._lock:
                     if generation != self._generation:
                         return
-                    for action in actions[: self.n_action_steps]:
-                        self._pending.append((np.asarray(action, dtype=np.float32), meta))
+                    if rtc_on:
+                        # Chunk index i is the action for observation time + i
+                        # ticks, so what has gone stale is wall clock, not pops --
+                        # pops undercount through held ticks and underruns, and
+                        # dispatching on that count replays moments already past.
+                        dropped = max(0, min(int(math.ceil(latency * self.fps)), len(actions)))
+                        self._pending.clear()
+                        for action in actions[dropped:]:
+                            self._pending.append((np.asarray(action, dtype=np.float32), meta))
+                        self._chunk_raw = original[dropped:]
+                        self.last_rtc_delay = dropped
+                        self.last_rtc_prefix = 0 if prefix is None else int(prefix.shape[0])
+                    else:
+                        # Append this chunk's first n_action_steps behind whatever
+                        # is still queued. The mirror is kept up to date here too,
+                        # so that switching RTC on mid-run has a valid prefix to
+                        # guide its first chunk against.
+                        kept = (self._chunk_raw[self._consumed:]
+                                if self._chunk_raw is not None else original[:0])
+                        self._chunk_raw = self.torch.cat([kept, original[: self.n_action_steps]])
+                        for action in actions[: self.n_action_steps]:
+                            self._pending.append((np.asarray(action, dtype=np.float32), meta))
+                        self.last_rtc_delay = self.last_rtc_prefix = None
+                    self._consumed = 0
                     self.last_latency = latency
             except Exception as e:  # surfaced on the Tk thread by the caller
                 if generation != self._generation:
@@ -521,6 +780,13 @@ class DeployApp(RobotAppBase):
             "task": self.task_var.get().strip(),
             "fps": self.args.fps,
             "action_mode": "snap" if self._snap_var.get() else "raw",
+            # The settings, not the state: the checkbox is live, so whether any
+            # given tick was guided is recorded per tick in actions.jsonl.
+            "rtc": {
+                **rtc_settings(self.args),
+                "enabled": bool(self._rtc_var.get()),
+                "supported": bool(self.runner and self.runner.supports_rtc),
+            },
             "policy_type": self.runner.policy_type if self.runner else None,
             "device": self.runner.device if self.runner else None,
             "image_size": list(self.image_size),
@@ -555,6 +821,17 @@ class DeployApp(RobotAppBase):
                         value=True).pack(side="left")
         ttk.Radiobutton(mode_row, text="Raw (clamped)", variable=self._snap_var,
                         value=False).pack(side="left", padx=(10, 0))
+
+        # Unlike the snap radios, which _control_tick reads live, this has to
+        # reach a plain attribute the worker thread polls -- hence a command
+        # rather than a bare variable. It stays enabled while the policy runs on
+        # purpose: comparing the two within one rollout is the point of it.
+        self._rtc_var = tk.BooleanVar(value=bool(getattr(self.args, "rtc", False)))
+        rtc_row = ttk.Frame(frame)
+        rtc_row.pack(fill="x", pady=(0, 8))
+        self.rtc_check = ttk.Checkbutton(rtc_row, text="Real-time chunking",
+                                         variable=self._rtc_var, command=self._on_rtc_toggle)
+        self.rtc_check.pack(side="left")
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill="x")
@@ -591,18 +868,46 @@ class DeployApp(RobotAppBase):
                 if isinstance(widget, ttk.Button):
                     widget.state(["disabled"] if self._policy_running else ["!disabled"])
         self.record_btn.configure(text="Stop Record" if self._recording else "Record")
+        # Deliberately outside the loop above: this one stays usable mid-run.
+        # runner is None until the load worker lands, and this runs during __init__.
+        usable = self.runner is not None and getattr(self.runner, "supports_rtc", False)
+        self.rtc_check.state(["!disabled"] if usable else ["disabled"])
+        if not usable:
+            self._rtc_var.set(False)
         self.app_mode_status_var.set(self._mode_status_text())
+
+    def _on_rtc_toggle(self):
+        if self.runner is None:
+            return
+        enabled = bool(self._rtc_var.get())
+        self.runner.rtc_enabled = enabled
+        if enabled:
+            self._log("Real-time chunking on -- new chunks replace the queue, guided "
+                      "to meet the plan already running.")
+        else:
+            self._log("Real-time chunking off -- the queue drains before the next "
+                      "replan, so it may be a second before this takes effect.", level="warn")
+        self._update_status_label()
 
     def _update_status_label(self):
         if self._policy_running and self.runner is not None:
             latency = self.runner.last_latency
-            # n_action_steps - 1: the worker refills as soon as the queue drops
-            # below a full chunk, which is the first pop, so what it has to beat
-            # is the drain of what is left after that pop -- not the whole chunk.
-            budget = max(1, self.runner.n_action_steps - 1) * self._period
-            detail = f"queued {self.runner.queued}"
-            if latency:
-                detail += f"  ·  inference {latency * 1000:.0f}ms / {budget * 1000:.0f}ms budget"
+            if getattr(self.runner, "rtc_enabled", False):
+                # No budget to quote: the worker refills on a queue threshold
+                # rather than racing the drain of one chunk's n_action_steps.
+                detail = f"queued {self.runner.queued}  ·  rtc"
+                if latency:
+                    detail += f"  ·  inference {latency * 1000:.0f}ms"
+                if self.runner.last_rtc_delay is not None:
+                    detail += f"  ·  delay {self.runner.last_rtc_delay} ticks"
+            else:
+                # n_action_steps - 1: the worker refills as soon as the queue drops
+                # below a full chunk, which is the first pop, so what it has to beat
+                # is the drain of what is left after that pop -- not the whole chunk.
+                budget = max(1, self.runner.n_action_steps - 1) * self._period
+                detail = f"queued {self.runner.queued}"
+                if latency:
+                    detail += f"  ·  inference {latency * 1000:.0f}ms / {budget * 1000:.0f}ms budget"
             self.policy_status_var.set(
                 "Policy priming -- waiting for the first actions"
                 if self._priming else f"Policy running -- tick {self._tick_index}"
@@ -650,6 +955,8 @@ class DeployApp(RobotAppBase):
                 self.args.checkpoint,
                 device=self.args.device,
                 n_action_steps=self.args.n_action_steps,
+                fps=self.args.fps,
+                rtc=rtc_settings(self.args),
             )
         except Exception as e:
             runner, error = None, e
@@ -670,7 +977,15 @@ class DeployApp(RobotAppBase):
             self.runner = runner
             self._log(f"Checkpoint ready in {time.monotonic() - self._load_started:.0f}s: "
                       f"{runner.policy_type} on {runner.device}, "
-                      f"{runner.n_action_steps} actions per inference", level="connected")
+                      f"{runner.n_action_steps} actions per inference"
+                      f"{', RTC available' if runner.supports_rtc else ', no RTC'}",
+                      level="connected")
+            if runner.stats_warning:
+                self._log(runner.stats_warning, level="warn")
+            if self.args.rtc and not runner.supports_rtc:
+                self._log(f"--rtc ignored: {runner.policy_type} is not a flow-matching "
+                          "policy and has no real-time chunking path.", level="warn")
+            self._rtc_var.set(bool(runner.rtc_enabled))
         self._set_policy_buttons_state()
         self._update_status_label()
 
@@ -836,6 +1151,13 @@ class DeployApp(RobotAppBase):
             entry["queued"] = self.runner.queued
             entry["inference_s"] = (round(self.runner.last_latency, 4)
                                     if self.runner.last_latency else None)
+            # Per tick because the checkbox is live. rtc_delay is also how the
+            # seams are found offline: it is rewritten exactly when a chunk was
+            # replaced, so a change in it marks the tick a new plan took over.
+            entry["rtc"] = bool(self.runner.rtc_enabled)
+            if self.runner.rtc_enabled:
+                entry["rtc_delay"] = self.runner.last_rtc_delay
+                entry["rtc_prefix"] = self.runner.last_rtc_prefix
         # What the link did with it. Without these the log records what was
         # *submitted* and says nothing about what reached the board -- a run whose
         # speed commands were all discarded for staleness reads identically to one
