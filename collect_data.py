@@ -98,7 +98,7 @@ def parse_args():
     p.add_argument("--remote-camera-port", type=int, default=8267,
                    help="port to listen on for --remote-camera")
     p.add_argument("--fps", type=int, default=25, help="dataset recording rate")
-    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="LeRobot dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_green_marker", help="LeRobot dataset repo id")
     p.add_argument("--root", default=None, help="dataset directory (default: data/lerobot/<repo-id>)")
     p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1],
                    help="frame width stored in the dataset (must match the camera's aspect ratio)")
