@@ -15,18 +15,37 @@ score well here and still fail on hardware.
 
 Read the numbers in this order:
 
-1. MSE vs the predict-the-mean baseline. A policy at or above baseline has learned
-   nothing from the image; that is the single most useful signal here.
-2. Prediction spread per dimension. A std near zero is mode collapse -- the policy
+1. Balanced accuracy per dimension. Teleop emits only the discrete levels in
+   features.ACTION_LEVELS, so predictions are snapped to those levels and scored
+   as a classification. Balanced accuracy -- mean recall over the classes present
+   in the ground truth -- is the verdict signal, because a policy that ignores the
+   image and emits one constant scores exactly at chance (1/k) no matter how
+   skewed the dimension is. Plain accuracy does not have that property: dim 0 is
+   stopped in 90.6% of frames, so constant-zero scores 0.906 there.
+2. The confusion matrix for any dimension whose balanced accuracy is near chance.
+   It says immediately whether the policy is collapsing to one class, flipping
+   direction, or getting direction right and timing wrong.
+3. Prediction spread per dimension. A std near zero is mode collapse -- the policy
    emits one action regardless of input.
-3. Same-input spread (--repeats). pi0.5 is a flow-matching model that draws fresh
+4. Same-input spread (--repeats). pi0.5 is a flow-matching model that draws fresh
    noise every call, so repeated predictions on an identical frame genuinely differ.
-   That variance is the policy, not measurement error, and a large MSE alongside a
-   large same-input spread means something different from a large MSE alone.
+   That variance is the policy, not measurement error, and a large error alongside
+   a large same-input spread means something different from a large error alone.
+5. MSE, read last and without a verdict. It is reported because it is what the
+   policy was trained on and it is comparable across runs, but on a bang-bang
+   action space it is not a fitness test: squared error rewards hedging toward the
+   mean on rare high-amplitude classes, so a do-nothing policy sits at the
+   predict-the-mean baseline while a policy with the right direction and one frame
+   of timing error scores far worse. Read balanced accuracy for the verdict.
 
 Raw per-dimension numbers are in command units and are the readable ones. The
 *average* is reported normalized by ACTION_COMMAND_LIMITS, because dim 0 spans
 +/-900 while dim 3 spans 90 -- a raw average would be almost entirely dim 0.
+
+Sample size matters more than it looks. Dimension 0 is non-zero in under 10% of
+frames, so the default --max-frames is set high enough that the rare classes get
+a usable number of examples; scoring 200 frames leaves ~16 base-motion events and
+any verdict on dim 0 is then sampling noise.
 """
 
 import argparse
@@ -54,7 +73,13 @@ from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.constants import ACTION
 
 from lone_data.checkpoints import default_root, same_dataset, training_dataset
-from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_NAMES
+from lone_data.features import (
+    ACTION_COMMAND_LIMITS,
+    ACTION_LEVEL_LABELS,
+    ACTION_LEVELS,
+    ACTION_NAMES,
+)
+from lone_data.metrics import score_dimension, verdict
 
 SPANS = np.array([hi - lo for lo, hi in ACTION_COMMAND_LIMITS], dtype=np.float64)
 
@@ -68,7 +93,11 @@ def parse_args():
                    help="dataset directory (default: data/lerobot/<repo-id>)")
     p.add_argument("--repo-id", required=True, help="dataset repo id") # e.g. lone/l_one_marker_pickup
     p.add_argument("--episodes", default=None, help="comma-separated episode indices (default: all)")
-    p.add_argument("--max-frames", type=int, default=200, help="cap on frames scored")
+    p.add_argument("--max-frames", type=int, default=2000,
+                   help="cap on frames scored. The rare classes set this: dim 0 is "
+                        "non-zero in under 10%% of frames, so 2000 frames buys ~190 "
+                        "base-motion events and 200 would buy ~16. Lower it only for "
+                        "a smoke test, and do not read a per-dimension verdict off one.")
     p.add_argument("--repeats", type=int, default=8,
                    help="re-predictions per frame for the same-input spread (0 disables)")
     p.add_argument("--repeat-frames", type=int, default=4, help="frames used for --repeats")
@@ -140,6 +169,44 @@ def summarize(values):
     }
 
 
+def report_classification(true_first, pred_first):
+    """The headline block: snap both to the discrete levels, score the confusion.
+
+    See lone_data/metrics.py for why this and not squared error.
+    """
+    print("\n" + "=" * 78)
+    print("CLASSIFICATION (predictions snapped to the discrete levels teleop emits)")
+    print("=" * 78)
+    print(f"  {'dimension':24s} {'balanced':>9s} {'chance':>7s} "
+          f"{'accuracy':>9s} {'majority':>9s}   verdict")
+
+    per_dim = [score_dimension(true_first[:, j], pred_first[:, j], ACTION_LEVELS[j])
+               for j in range(len(ACTION_NAMES))]
+    for name, sc in zip(ACTION_NAMES, per_dim):
+        print(f"  {name:24s} {sc['balanced_accuracy']:9.3f} {sc['chance']:7.3f} "
+              f"{sc['accuracy']:9.3f} {sc['majority_accuracy']:9.3f}   {verdict(sc)}")
+    mean_balanced = np.nanmean([sc["balanced_accuracy"] for sc in per_dim])
+    print(f"  {'-- mean (balanced)':24s} {mean_balanced:9.3f}")
+    print("\n  balanced = mean recall over the classes present; chance = 1/k, which is also")
+    print("  what a policy emitting one constant scores. majority = that constant's plain")
+    print("  accuracy, shown to make clear why plain accuracy cannot be the verdict either.")
+
+    print("\n" + "-" * 78)
+    print("CONFUSION (rows = ground truth, columns = prediction)")
+    print("-" * 78)
+    for j, name in enumerate(ACTION_NAMES):
+        labels = ACTION_LEVEL_LABELS[j]
+        cm = np.array(per_dim[j]["confusion"])
+        recall = per_dim[j]["recall"]
+        print(f"\n  {name}")
+        print(" " * 12 + "".join(f"{l:>9s}" for l in labels) + f"{'recall':>9s}")
+        for r, label in enumerate(labels):
+            row = "".join(f"{v:9d}" for v in cm[r])
+            rec = "      n/a" if np.isnan(recall[r]) else f"{recall[r]:9.3f}"
+            print(f"    {label:>8s}{row}{rec}")
+    return per_dim
+
+
 def table(title, per_dim, average=None, width=24):
     print(f"\n{title}")
     for name, value in zip(ACTION_NAMES, per_dim):
@@ -186,6 +253,9 @@ def main():
     pred_first = np.stack(pred_first)
     true_first = np.stack(true_first)
 
+    # The verdict block. Everything below it is a diagnostic for reading it.
+    class_stats = report_classification(true_first, pred_first)
+
     one_step_raw = ((pred_first - true_first) ** 2).mean(0)
     one_step_norm = (((pred_first - true_first) / SPANS) ** 2).mean(0)
     # Baseline: the best a policy can do while ignoring the image entirely.
@@ -193,22 +263,18 @@ def main():
     base_raw = ((mean_action - true_first) ** 2).mean(0)
     base_norm = (((mean_action - true_first) / SPANS) ** 2).mean(0)
 
-    print("\n" + "=" * 66)
-    print("ONE-STEP MSE (raw command units, per dimension)")
-    print("=" * 66)
-    print(f"  {'dimension':24s} {'policy':>12s} {'baseline':>12s}   verdict")
+    print("\n" + "=" * 78)
+    print("ONE-STEP MSE (raw command units, per dimension) -- diagnostic, not a verdict")
+    print("=" * 78)
+    print(f"  {'dimension':24s} {'policy':>12s} {'baseline':>12s}")
     for j, name in enumerate(ACTION_NAMES):
-        if true_first[:, j].std() < 1e-9:
-            # The mean predicts a constant perfectly, so the baseline is 0 and nothing
-            # can beat it. That says the sample is uninformative for this dimension --
-            # too few frames, or a joint unused in them -- not that the policy failed.
-            verdict = "ground truth constant -- uninformative sample"
-        elif one_step_raw[j] < base_raw[j]:
-            verdict = "learned something"
-        else:
-            verdict = "no better than mean"
-        print(f"  {name:24s} {one_step_raw[j]:12.3f} {base_raw[j]:12.3f}   {verdict}")
+        print(f"  {name:24s} {one_step_raw[j]:12.3f} {base_raw[j]:12.3f}")
     print(f"  {'-- average (normalized)':24s} {one_step_norm.mean():12.4f} {base_norm.mean():12.4f}")
+    print("\n  No verdict column: on a bang-bang action space, beating the predict-the-mean")
+    print("  baseline is neither necessary nor sufficient for having learned the dimension.")
+    print("  Constant-zero sits at baseline on dim 0 while learning nothing, and a policy")
+    print("  with the right direction and a frame of timing error scores far above it.")
+    print("  Read the balanced accuracy above instead.")
 
     chunk_norm = np.stack(chunk_se).mean(axis=(0, 1)) if chunk_se else None
     if chunk_norm is not None:
@@ -251,6 +317,8 @@ def main():
             "policy_type": cfg.type,
             "frames_scored": int(n),
             "action_names": ACTION_NAMES,
+            "action_levels": [list(l) for l in ACTION_LEVELS],
+            "classification": class_stats,
             "one_step_mse_raw": one_step_raw.tolist(),
             "one_step_mse_normalized": one_step_norm.tolist(),
             "baseline_mse_raw": base_raw.tolist(),

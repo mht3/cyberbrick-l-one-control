@@ -183,23 +183,12 @@ Both policies go through [`scripts/train.py`](scripts/train.py), which takes exa
 Checkpoints land in `outputs/train/` and stay there; the dataset is read off disk via
 `--dataset.root`.
 
-**ACT** is the cheaper baseline and needs no Hub access:
-
-```sh
-python scripts/train.py \
-  --dataset.repo_id=lone/l_one_green_marker \
-  --dataset.root=data/lerobot/lone/l_one_green_marker \
-  --policy.type=act \
-  --policy.normalization_mapping='{"VISUAL":"MEAN_STD","STATE":"MEAN_STD","ACTION":"MIN_MAX"}' \
-  --policy.device=cuda \
-  --batch_size=8 --steps=30000
-```
-
 **π0.5** needs Hub access for the gated PaliGemma tokenizer and the base weights:
 
 ```sh
 hf auth login   # google/paligemma-3b-pt-224 is gated; accept its licence first
 
+```sh
 python scripts/train.py \
   --dataset.repo_id=lone/l_one_green_marker \
   --dataset.root=data/lerobot/lone/l_one_green_marker \
@@ -214,8 +203,8 @@ python scripts/train.py \
   --policy.dtype=bfloat16 \
   --policy.device=cuda \
   --batch_size=8 --num_workers=8 \
-  --steps=150000 --policy.scheduler_decay_steps=150000 \
-  --save_freq=5000 \
+  --steps=200000 --policy.scheduler_decay_steps=200000 \
+  --save_freq=10000 \
   --wandb.enable=true --wandb.project=lone --wandb.disable_artifact=true
 ```
 
@@ -255,16 +244,21 @@ Throughput, RTX 5090 (32 GB), one camera, `l_one_green_marker`:
 Batch size buys no throughput: 8 → 16 → 32 holds at ~7 samples/s, and above bs 12
 (`empty_cameras=0`) or bs 5 (`empty_cameras=2`) it OOMs. Raise it only for less noisy steps.
 
-`--save_freq=5000` writes a full checkpoint to `outputs/train/<date>/<time>_pi05/checkpoints/`
+`--save_freq=10000` writes a full checkpoint to `outputs/train/<date>/<time>_pi05/checkpoints/`
 plus a `last/` symlink:
 
 ```
-checkpoints/000005000/pretrained_model/model.safetensors   the policy
-checkpoints/000005000/pretrained_model/config.json         + its processor pipelines
-checkpoints/000005000/training_state/                      optimizer, scheduler, RNG, step
+checkpoints/010000/pretrained_model/model.safetensors   the policy
+checkpoints/010000/pretrained_model/config.json         + its processor pipelines
+checkpoints/010000/training_state/                      optimizer, scheduler, RNG, step
 ```
 
 Resume with `--resume=true --config_path=<checkpoint>/pretrained_model/train_config.json`.
+
+**The default checkpoint** for everything below is
+`outputs/train/2026-08-28/15-17-51_pi05/checkpoints/200000` -- π0.5 on
+`l_one_green_marker` for 200k steps with exactly the flags above, and what
+`checkpoints/last` points at. Swap in your own run path wherever it appears.
 
 **What `--policy.train_expert_only=true` trains** -- 693.4M of 4.14B params (16.7%):
 
@@ -292,7 +286,7 @@ four pretrained position dimensions as PWM and servo speeds.
 
 ```sh
 python scripts/eval_policy.py \
-  --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
+  --checkpoint outputs/train/2026-08-28/15-17-51_pi05/checkpoints/last/pretrained_model \
   --repo-id lone/l_one_green_marker
 ```
 
@@ -304,16 +298,49 @@ cannot see compounding error.
 
 Read the output in this order:
 
-1. **MSE against the predict-the-mean baseline.** At or above baseline means nothing was learned
-   from the image. Where a dimension is constant across sampled frames the baseline is 0 and
-   unbeatable, and the script says so.
-2. **Prediction spread per dimension**, beside the ground truth's. Near zero is mode collapse.
-3. **Same-input spread** (`--repeats`, default 8). π0.5 draws fresh noise every call, so repeated
+1. **Balanced accuracy per dimension.** Teleop only ever emitted the discrete levels in
+   `ACTION_LEVELS` -- ±900/0 on the base, ±100/0 on each arm joint, open/closed on the gripper --
+   and deployment snaps the policy's continuous output back onto them before anything reaches the
+   board. So the eval snaps too and scores the confusion. Balanced accuracy is mean recall over
+   the classes present, and it is the verdict number because **a policy that ignores the image and
+   emits one constant scores exactly chance (1/k) on it, whatever the class balance.** Neither
+   plain accuracy nor MSE has that property.
+2. **The confusion matrix** for any dimension near chance. It separates the three ways a dimension
+   fails -- collapsed to one class, right about moving but wrong about direction, right about
+   direction but wrong about timing -- which the headline number cannot.
+3. **Prediction spread per dimension**, beside the ground truth's. Near zero is mode collapse.
+4. **Same-input spread** (`--repeats`, default 8). π0.5 draws fresh noise every call, so repeated
    predictions on one frame genuinely differ -- roughly `[240, 27, 15, 13]` per dimension, where
    ACT reports exactly `0.0000`.
+5. **MSE, last, and with no verdict attached.** It is what the policy was trained on and it is
+   comparable across runs, so it is still printed -- but on a bang-bang action space it is not a
+   fitness test, and the script no longer pretends otherwise.
 
-Per-dimension numbers are raw command units; the average is normalized by `ACTION_COMMAND_LIMITS`,
-since dim 0 spans ±900 and dim 3 spans 90. `--json <path>` writes the same figures machine-readably.
+**Why MSE lost its verdict column.** The base motor is stopped in 90.6% of frames, so a policy
+emitting a constant 0 sits *at* the predict-the-mean baseline while having learned nothing -- "no
+better than mean" and "learned nothing" are the same point, and the metric cannot separate them.
+Meanwhile a policy with the right direction and one frame of timing error scores far *worse* than
+that do-nothing policy, because a miss on dim 0 costs (900)² against the gripper's (90)². Squared
+error rewards hedging toward the majority level on exactly the dimensions where committing
+matters. `lone_data/metrics.py` carries the argument in full and `tests/test_metrics.py` asserts
+it.
+
+The two metrics disagree in practice, not just in principle. On the 150k-step π0.5 checkpoint over
+`lone/l_one_manipulation`, dim 0 scores **balanced accuracy 0.486 against a chance of 0.333** while
+its MSE (90092) sits *above* the predict-the-mean baseline (75894). The confusion matrix says why:
+of 192 base-motion frames the policy gets the direction wrong twice, and misses the rest by
+predicting *stop*. It has learned which way to drive and under-commits to driving -- and every
+frame where it does commit and is a tick early costs squared error 810000, so MSE scores that
+policy as worse than one that never moves the base at all.
+
+**`--max-frames` defaults to 2000, not 200.** The rare classes set the sample size: the base is
+non-zero in under 10% of frames and splits that across two directions, so 200 frames leave ~16
+base-motion events and any per-dimension verdict on dim 0 is sampling noise. 2000 frames buy ~190.
+A verdict resting on fewer than 30 examples of the rarest class is tagged `-- too few examples to call`.
+
+Per-dimension MSE numbers are raw command units; the average is normalized by
+`ACTION_COMMAND_LIMITS`, since dim 0 spans ±900 and dim 3 spans 90. `--json <path>` writes the same
+figures machine-readably, confusion matrices included.
 
 `--root` defaults to `data/lerobot/<repo-id>` and is worth watching: `LeRobotDataset` loads from
 `root` and treats `repo_id` as a label, so a stale `--root` scores the checkpoint against episodes
@@ -322,7 +349,7 @@ it never saw while the output looks completely normal.
 ## Deployment
 
 ```sh
-python deploy_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model
+python deploy_policy.py --checkpoint outputs/train/2026-08-28/15-17-51_pi05/checkpoints/last/pretrained_model --remote-camera
 ```
 
 A GUI in the same shape as `collect_data.py`: connect over Serial or WiFi, confirm the task
@@ -346,6 +373,15 @@ window close, on link death, and from a `finally` around the main loop, each pre
 - **The checkpoint loads once, at startup**, on a worker thread -- π0.5 takes ~70 s to reach the
   GPU. Start Policy stays disabled until the log says `Checkpoint ready`, and the weights outlive
   every rollout.
+- **On a fresh machine, prime the Hub cache once before going offline.** `lone_data/__init__.py`
+  forces `HF_HUB_OFFLINE=1` before LeRobot is imported, and unlike `eval_policy.py` (which lifts
+  that unless `LONE_EVAL_OFFLINE=1`) `deploy_policy.py` never does -- so the first run on a machine
+  that hasn't cached PaliGemma's tokenizer fails with `failed to instantiate processor step
+  tokenizer processor`, not a login problem. Run once with network access to populate
+  `~/.cache/huggingface/`, then every run after is fully offline:
+  ```sh
+  HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 python deploy_policy.py --checkpoint <checkpoint> --remote-camera
+  ```
 - **Inference runs on a worker thread** (~280 ms on an RTX 5090, most of a control period) and
   keeps the action queue filled; the control tick only pops and dispatches. One inference covers
   `n_action_steps / fps` = 0.40 s at 25 Hz. On an underrun the last action is held for 3 ticks and
@@ -385,7 +421,7 @@ run.json       checkpoint, task, fps, action mode, RTC settings, device, git SHA
 
 ```sh
 python deploy_policy_training_data_replay.py \
-  --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
+  --checkpoint outputs/train/2026-08-28/15-17-51_pi05/checkpoints/last/pretrained_model \
   --repo-id lone/l_one_green_marker --root data/lerobot/lone/l_one_green_marker --remote-camera
 ```
 
@@ -410,8 +446,10 @@ Run the three configurations in order -- each isolates a different failure:
   from; expect about `n_action_steps`, or 400 ms at 25 Hz. `--lookahead K` submits frame `cursor+K`
   while the panes and plots still follow the cursor.
 - **Ground truth is on screen**: a dashed demonstration trace beside the commanded one, plus a
-  running match rate. That and the mean/max lag are appended to `actions.jsonl` as a `run_summary`
-  line when the run ends.
+  running match rate and balanced accuracy (see *Evaluating a checkpoint* for why match rate alone
+  is misleading on a bang-bang action space -- a frozen base scores ~90% match while learning
+  nothing). That and the mean/max lag are appended to `actions.jsonl` as a `run_summary` line when
+  the run ends.
 - **Feed perturbation** (`--brightness`, `--contrast`, `--noise`, `--jpeg-quality`, and live
   sliders) degrades the dataset frame before the deploy path, with the demonstration's own actions
   underneath as the control. This is how you find out why a live camera does worse: training and
