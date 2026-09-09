@@ -188,6 +188,7 @@ Checkpoints land in `outputs/train/` and stay there; the dataset is read off dis
 ```sh
 hf auth login   # google/paligemma-3b-pt-224 is gated; accept its licence first
 
+```sh
 python scripts/train.py \
   --dataset.repo_id=lone/l_one_green_marker \
   --dataset.root=data/lerobot/lone/l_one_green_marker \
@@ -335,7 +336,7 @@ policy as worse than one that never moves the base at all.
 **`--max-frames` defaults to 2000, not 200.** The rare classes set the sample size: the base is
 non-zero in under 10% of frames and splits that across two directions, so 200 frames leave ~16
 base-motion events and any per-dimension verdict on dim 0 is sampling noise. 2000 frames buy ~190.
-A verdict resting on fewer than 30 examples of the rarest class is tagged `(thin sample)`.
+A verdict resting on fewer than 30 examples of the rarest class is tagged `-- too few examples to call`.
 
 Per-dimension MSE numbers are raw command units; the average is normalized by
 `ACTION_COMMAND_LIMITS`, since dim 0 spans ±900 and dim 3 spans 90. `--json <path>` writes the same
@@ -372,6 +373,15 @@ window close, on link death, and from a `finally` around the main loop, each pre
 - **The checkpoint loads once, at startup**, on a worker thread -- π0.5 takes ~70 s to reach the
   GPU. Start Policy stays disabled until the log says `Checkpoint ready`, and the weights outlive
   every rollout.
+- **On a fresh machine, prime the Hub cache once before going offline.** `lone_data/__init__.py`
+  forces `HF_HUB_OFFLINE=1` before LeRobot is imported, and unlike `eval_policy.py` (which lifts
+  that unless `LONE_EVAL_OFFLINE=1`) `deploy_policy.py` never does -- so the first run on a machine
+  that hasn't cached PaliGemma's tokenizer fails with `failed to instantiate processor step
+  tokenizer processor`, not a login problem. Run once with network access to populate
+  `~/.cache/huggingface/`, then every run after is fully offline:
+  ```sh
+  HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 python deploy_policy.py --checkpoint <checkpoint> --remote-camera
+  ```
 - **Inference runs on a worker thread** (~280 ms on an RTX 5090, most of a control period) and
   keeps the action queue filled; the control tick only pops and dispatches. One inference covers
   `n_action_steps / fps` = 0.40 s at 25 Hz. On an underrun the last action is held for 3 ticks and
@@ -436,8 +446,10 @@ Run the three configurations in order -- each isolates a different failure:
   from; expect about `n_action_steps`, or 400 ms at 25 Hz. `--lookahead K` submits frame `cursor+K`
   while the panes and plots still follow the cursor.
 - **Ground truth is on screen**: a dashed demonstration trace beside the commanded one, plus a
-  running match rate. That and the mean/max lag are appended to `actions.jsonl` as a `run_summary`
-  line when the run ends.
+  running match rate and balanced accuracy (see *Evaluating a checkpoint* for why match rate alone
+  is misleading on a bang-bang action space -- a frozen base scores ~90% match while learning
+  nothing). That and the mean/max lag are appended to `actions.jsonl` as a `run_summary` line when
+  the run ends.
 - **Feed perturbation** (`--brightness`, `--contrast`, `--noise`, `--jpeg-quality`, and live
   sliders) degrades the dataset frame before the deploy path, with the demonstration's own actions
   underneath as the control. This is how you find out why a live camera does worse: training and
