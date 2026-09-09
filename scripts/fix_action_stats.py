@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_NAMES
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_green_marker"
 
 
 def parse_args():

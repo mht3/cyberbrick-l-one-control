@@ -20,16 +20,13 @@ must stay in agreement -- change one, check the other.
 
 import numpy as np
 
-from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_DIM
+from lone_data.features import ACTION_COMMAND_LIMITS, ACTION_DIM, ACTION_LEVELS
 
 # What teleop can actually emit per channel, from virtual_gripper.py's constants.
-# A continuous prediction is snapped onto the nearest of these.
-DEMONSTRATED_LEVELS = [
-    (-900.0, 0.0, 900.0),   # base_motor_speed      -- +/-MOTOR_SPEED or stopped
-    (-100.0, 0.0, 100.0),   # upper_arm_servo_speed -- +/-JOINT_SPEED or stopped
-    (-100.0, 0.0, 100.0),   # lower_arm_servo_speed -- +/-JOINT_SPEED or stopped
-    (30.0, 120.0),          # gripper_angle         -- open or closed, nothing between
-]
+# A continuous prediction is snapped onto the nearest of these. The list lives in
+# features.py because scripts/eval_policy.py scores against the same levels, and a
+# second copy here would let the eval and the arm drift apart silently.
+DEMONSTRATED_LEVELS = ACTION_LEVELS
 
 
 def clamp_to_limits(action):

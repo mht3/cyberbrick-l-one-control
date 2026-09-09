@@ -125,6 +125,42 @@ ACTION_COMMAND_LIMITS = [
     (30.0, 120.0),    # gripper_angle         -- OPEN_ANGLE .. CLOSED_ANGLE
 ]
 
+# The discrete levels teleop actually emits on each channel. Every action in every
+# recorded episode is one of these -- dimensions 0-2 are bang-bang (drive one way,
+# stop, drive the other) and the gripper is a two-position latch. Nothing in the
+# collection path can produce an intermediate value; see ACTION_SEMANTICS above and
+# virtual_gripper.JointControl, which only ever dispatches +/-full-scale or a stop.
+#
+# This is what makes squared error the wrong verdict metric for this action space.
+# Dimension 0 is 0 in 90.6% of frames, so a policy that emits a constant 0 scores
+# at the predict-the-mean baseline while having learned nothing, and a policy that
+# gets the direction right but the timing off by a frame scores far worse while
+# having learned a great deal. Snap predictions to these levels and score the
+# classification instead -- lone_data/metrics.py makes the argument in full.
+#
+# Declared here rather than in dispatch.py because two things need it and they are
+# not the same concern: deployment snaps a policy's continuous output onto these
+# before dispatching it (dispatch.snap_to_levels, aliased there as
+# DEMONSTRATED_LEVELS), and evaluation snaps both prediction and ground truth onto
+# them to score the result. Those two must use one list or the eval stops measuring
+# what deployment dispatches.
+#
+# Keep in sync with ACTION_COMMAND_LIMITS and virtual_gripper.py.
+ACTION_LEVELS = [
+    (-900.0, 0.0, 900.0),  # base_motor_speed      -- reverse / stop / forward
+    (-100.0, 0.0, 100.0),  # upper_arm_servo_speed -- down / stop / up
+    (-100.0, 0.0, 100.0),  # lower_arm_servo_speed -- down / stop / up
+    (30.0, 120.0),         # gripper_angle         -- open / closed
+]
+
+# Short labels for the levels above, in the same order, for confusion matrices.
+ACTION_LEVEL_LABELS = [
+    ("-900", "0", "+900"),
+    ("-100", "0", "+100"),
+    ("-100", "0", "+100"),
+    ("open", "closed"),
+]
+
 
 ZERO_DISPATCH_CONVENTION = (
     "For dimensions 0-2, an action value of 0 was dispatched via stop_motor()/stop_servo(), "

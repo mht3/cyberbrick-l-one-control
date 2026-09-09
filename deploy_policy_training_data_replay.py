@@ -20,7 +20,8 @@ on the arm for real, so a failure here is a failure of the real thing.
 Three things this shows that the live GUI cannot:
 
 The recorded action is known, so every tick can be compared against ground truth
-as it happens -- an exact-match rate under snapping, and a normalized MSE. That is
+as it happens -- balanced accuracy, an exact-match rate under snapping, and a
+normalized MSE. That is
 scripts/eval_policy.py's measurement taken live, with the arm moving.
 
 Inference lag is measurable rather than inferred. Each action carries the index of
@@ -62,9 +63,11 @@ from lone_data.perturb import FeedPerturbation
 from lone_data.features import (
     ACTION_COMMAND_LIMITS,
     ACTION_DIM,
+    ACTION_LEVELS,
     ACTION_NAMES,
     resize_keep_aspect,
 )
+from lone_data.metrics import classification_scores, snap_to_level_index
 
 from deploy_policy import (
     CHANNELS,
@@ -127,12 +130,20 @@ class ReplayStats:
     the arm was told to do what the demonstration did. MSE is kept alongside it
     because in raw mode nothing matches exactly and the match rate goes to zero
     without saying how close the miss was.
+
+    Neither is a fitness test on its own, for the reason lone_data/metrics.py sets
+    out: the base is stopped in 90.6% of frames, so an arm that never moves its base
+    scores 90% agreement on that dimension and sits at the predict-the-mean MSE
+    baseline. Balanced accuracy is accumulated alongside them and is the number to
+    read -- doing one thing forever scores chance on it, whatever the class balance.
     """
 
     def __init__(self):
         self.ticks = 0
         self.matches = np.zeros(ACTION_DIM, dtype=np.int64)
         self.sq_error = np.zeros(ACTION_DIM, dtype=np.float64)
+        self.confusions = [np.zeros((len(levels), len(levels)), dtype=np.int64)
+                           for levels in ACTION_LEVELS]
         self.lags = []
 
     def add(self, dispatched, truth, lag):
@@ -141,8 +152,24 @@ class ReplayStats:
         t = np.asarray(truth, dtype=np.float64)
         self.matches += (d == t)
         self.sq_error += ((d - t) / SPANS) ** 2
+        # Snapped, so raw mode is scored on the same grid as snapped mode rather
+        # than reporting a match rate of zero.
+        for j, levels in enumerate(ACTION_LEVELS):
+            self.confusions[j][snap_to_level_index(t[j], levels),
+                               snap_to_level_index(d[j], levels)] += 1
         if lag is not None:
             self.lags.append(lag)
+
+    @property
+    def class_scores(self):
+        return [classification_scores(cm) for cm in self.confusions]
+
+    @property
+    def balanced_accuracy(self):
+        """Mean over dimensions of the per-dimension balanced accuracy."""
+        if not self.ticks:
+            return float("nan")
+        return float(np.nanmean([sc["balanced_accuracy"] for sc in self.class_scores]))
 
     @property
     def match_rate(self):
@@ -159,6 +186,11 @@ class ReplayStats:
             "action_names": ACTION_NAMES,
             "match_rate": round(self.match_rate, 4),
             "match_rate_per_dim": [round(float(m) / self.ticks, 4) for m in self.matches],
+            "balanced_accuracy": round(self.balanced_accuracy, 4),
+            "balanced_accuracy_per_dim": [round(sc["balanced_accuracy"], 4)
+                                          for sc in self.class_scores],
+            "chance_per_dim": [round(sc["chance"], 4) for sc in self.class_scores],
+            "confusion_per_dim": [cm.tolist() for cm in self.confusions],
             "mse_normalized_per_dim": [round(float(e) / self.ticks, 6) for e in self.sq_error],
             "mse_normalized": round(float(self.sq_error.sum()) / (self.ticks * ACTION_DIM), 6),
             "lag_ticks_mean": round(float(np.mean(self.lags)), 2) if self.lags else None,
@@ -701,7 +733,9 @@ class ReplayApp(DeployApp):
         if not summary.get("ticks"):
             return
         self._log(
-            f"Replay: {summary['ticks']} ticks  ·  match {summary['match_rate'] * 100:.0f}%  ·  "
+            f"Replay: {summary['ticks']} ticks  ·  "
+            f"balanced {summary['balanced_accuracy'] * 100:.0f}%  ·  "
+            f"match {summary['match_rate'] * 100:.0f}%  ·  "
             f"normalized MSE {summary['mse_normalized']:.4f}"
             + (f"  ·  lag {summary['lag_ticks_mean']:.1f} ticks mean"
                if summary["lag_ticks_mean"] is not None else ""),
@@ -743,6 +777,7 @@ class ReplayApp(DeployApp):
         if self._stats.ticks:
             s = self._stats
             self.replay_match_var.set(
+                f"balanced {s.balanced_accuracy * 100:.0f}%  ·  "
                 f"match {s.match_rate * 100:.0f}%  ·  MSE "
                 f"{s.sq_error.sum() / (s.ticks * ACTION_DIM):.4f} over {s.ticks} ticks"
             )
