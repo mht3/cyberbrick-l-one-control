@@ -18,13 +18,13 @@ from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 
 from lone_data.validation import describe_state_policy_support, validate_dataset
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one_green_marker"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_manipulation_multiview"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one_green_marker", help="dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_manipulation_multiview", help="dataset repo id")
     return p.parse_args()
 
 

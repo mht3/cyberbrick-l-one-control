@@ -2,7 +2,13 @@
 """Deployment GUI: drive the CyberBrick L-ONE arm from a trained checkpoint.
 
 A peer of collect_data.py -- same connection bar, same joint controls and
-keybindings, same camera dropdown -- with a policy mode on top.
+keybindings, same camera panel -- with a policy mode on top.
+
+Up to two camera views, Cam1 (front) above Cam2 (side), and both are handed to
+the policy. Which views the policy actually reads is the checkpoint's decision,
+not the GUI's: the image keys are taken from its own config, so a one-camera
+checkpoint keeps working with two cameras connected and a two-camera checkpoint
+says so when only one is.
 
 The working shape of a deployment is: connect, teleoperate the arm to a sensible
 starting position, check the task prompt, hand control to the policy, watch what
@@ -54,7 +60,6 @@ from tkinter import ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
 
 from virtual_gripper import (
     BASE_MOTOR,
@@ -73,7 +78,11 @@ from lone_data.features import (
     ACTION_COMMAND_LIMITS,
     ACTION_DIM,
     ACTION_NAMES,
+    CAMERA_KEY,
     DEFAULT_IMAGE_SIZE,
+    MAX_CAMERAS,
+    camera_label,
+    dataset_camera_keys,
     resize_keep_aspect,
 )
 from lone_data.robot_gui import RobotAppBase, WIFI_HEARTBEAT_MS
@@ -81,7 +90,6 @@ from lone_data.robot_gui import RobotAppBase, WIFI_HEARTBEAT_MS
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 CHANNELS = (BASE_MOTOR, UPPER_ARM_SERVO, LOWER_ARM_SERVO, GRIPPER_SERVO)
 
-DISPLAY_MAX_WIDTH = 640
 FEED_REFRESH_MS = 50    # ~20Hz preview, deliberately below the control rate
 PLOT_REFRESH_MS = 100   # ~10Hz, slower still so drawing never competes with control
 PLOT_WINDOW_S = 8.0     # seconds of wall-clock history on screen
@@ -102,14 +110,19 @@ def build_parser(description=__doc__):
     p.add_argument("--checkpoint", default=None,
                    help="a checkpoint's pretrained_model/ directory (required to run a policy)")
     p.add_argument("--task", default="", help="task prompt (defaults to the checkpoint's)")
-    p.add_argument("--camera-index", type=int, default=0)
+    p.add_argument("--camera-index", type=int, nargs="+", default=[0, 1], metavar="INDEX",
+                   help="cv2.VideoCapture index per camera view, Cam1 first")
+    p.add_argument("--cameras", type=int, default=None, choices=range(1, MAX_CAMERAS + 1),
+                   help=f"how many camera views to use (default: as many as are connected, "
+                        f"up to {MAX_CAMERAS})")
     p.add_argument("--list-cameras", action="store_true", help="probe camera indices and exit")
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--camera-fps", type=int, default=30)
     p.add_argument("--remote-camera", action="store_true",
                    help="receive camera frames over the network (see stream_camera.py)")
-    p.add_argument("--remote-camera-port", type=int, default=8267)
+    p.add_argument("--remote-camera-port", type=int, default=8267,
+                   help="base port for --remote-camera; Cam2 uses the next port up")
     p.add_argument("--fps", type=int, default=25, help="control rate")
     p.add_argument("--n-action-steps", type=int, default=None,
                    help="override how many actions are executed per inference")
@@ -312,6 +325,14 @@ class PolicyRunner:
         self.policy.eval().to(self.device)
         self.pre, self.post = make_pre_post_processors(policy_cfg=cfg, pretrained_path=checkpoint)
         self.n_action_steps = int(n_action_steps or getattr(cfg, "n_action_steps", 1) or 1)
+        # Which camera views this checkpoint reads, in slot order, taken from its
+        # own input features rather than from how many cameras happen to be
+        # plugged in. A one-camera checkpoint must ignore Cam2 rather than be
+        # handed a key it never trained on, and a two-camera checkpoint running on
+        # one camera has to be caught rather than silently fed half an observation.
+        self.image_keys = dataset_camera_keys(getattr(cfg, "input_features", {}) or {})
+        if not self.image_keys:
+            self.image_keys = [CAMERA_KEY]
         # Read here rather than on the Tk thread; surfaced by the caller once the
         # load lands, so it appears in the log next to "Checkpoint ready".
         self.stats_warning = action_stats_warning(checkpoint)
@@ -408,9 +429,10 @@ class PolicyRunner:
             self.last_rtc_delay = None
             self.last_rtc_prefix = None
 
-    def submit_frame(self, rgb, meta=None):
+    def submit_frame(self, rgbs, meta=None):
+        """`rgbs` is this tick's frames, one per image key, in slot order."""
         with self._lock:
-            self._frame = rgb
+            self._frame = rgbs
             self._frame_meta = meta
 
     def pop(self):
@@ -443,14 +465,18 @@ class PolicyRunner:
         """
         return self._running
 
-    def _observation(self, rgb):
-        # Must match what the dataset delivered at training time: CHW float in [0,1].
-        image = self.torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-        return {
-            "observation.images.front": image,
-            "observation.state": self.torch.zeros(ACTION_DIM),
-            "task": self.task,
+    def _observation(self, rgbs):
+        """One entry per image key the checkpoint declares, in slot order.
+
+        Must match what the dataset delivered at training time: CHW float in [0,1].
+        """
+        obs = {
+            key: self.torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+            for key, rgb in zip(self.image_keys, rgbs)
         }
+        obs["observation.state"] = self.torch.zeros(ACTION_DIM)
+        obs["task"] = self.task
+        return obs
 
     def _run(self, generation):
         from lerobot.policies.rtc import LatencyTracker
@@ -467,7 +493,7 @@ class PolicyRunner:
                 need = (len(self._pending) <= self.rtc_queue_threshold if rtc_on
                         else len(self._pending) < self.n_action_steps)
                 frame, meta = self._frame, self._frame_meta
-            if not need or frame is None:
+            if not need or not frame:
                 time.sleep(0.005)
                 continue
             try:
@@ -557,7 +583,8 @@ class DeployApp(RobotAppBase):
         self.args = args
         self.title("CyberBrick L-ONE Policy Deployment")
         self.configure(background=PALETTE["bg"])
-        self.minsize(1100, 720)
+        # Sized for two stacked camera panes; one view just leaves slack.
+        self.minsize(1150, 860)
         self._setup_style()
 
         # -- robot link state --------------------------------------------
@@ -579,18 +606,20 @@ class DeployApp(RobotAppBase):
         )
         self.bus.start()
 
-        # -- camera -------------------------------------------------------
-        self.camera = None
-        # Remote is only offered when the app was launched to receive a stream:
-        # on a machine nothing streams to, it is a dead menu entry.
-        self._camera_source = camera_source.pick_initial_source(
-            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index,
-            include_remote=args.remote_camera,
+        # -- cameras ------------------------------------------------------
+        # Two views by default whenever two cameras answer; one when that is all
+        # there is. Remote is only offered when the app was launched to receive a
+        # stream -- on a machine nothing streams to, it is a dead menu entry.
+        count = args.cameras or camera_source.detect_camera_count(
+            MAX_CAMERAS, prefer_remote=args.remote_camera)
+        preferred = ([camera_source.REMOTE_SOURCE] * MAX_CAMERAS if args.remote_camera
+                     else list(args.camera_index))
+        self._init_camera_state(
+            camera_source.pick_initial_sources(
+                preferred, MAX_CAMERAS, include_remote=args.remote_camera),
+            count,
         )
-        self._camera_connected = False
         self.image_size = (args.image_height, args.image_width)
-        # Instance-level so a subclass showing two video panes can narrow both.
-        self._display_width = DISPLAY_MAX_WIDTH
 
         # -- action state --------------------------------------------------
         # _current_action is the single record of what was last commanded, whoever
@@ -632,7 +661,7 @@ class DeployApp(RobotAppBase):
 
         # -- recording state (results/ only; never a LeRobotDataset) --------
         self._recording = False
-        self._writer = None
+        self._writers = []   # one mp4 per camera view the policy was given
         self._log_file = None
         self._result_dir = None
 
@@ -644,28 +673,16 @@ class DeployApp(RobotAppBase):
         main_row.pack(fill="both", expand=True)
 
         camera_frame = ttk.Frame(main_row, padding=(16, 16, 8, 16))
-        camera_frame.pack(side="left", fill="both", expand=True)
+        camera_frame.pack(side="left", fill="y")
 
         video_group = ttk.Frame(camera_frame)
         video_group.pack(anchor="n")
+        self._build_camera_panel(video_group)
 
-        source_row = ttk.Frame(video_group)
-        source_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(source_row, text="Camera").pack(side="left")
-        self.camera_source_var = tk.StringVar(value=self._camera_source_label(self._camera_source))
-        self.camera_combo = ttk.Combobox(
-            source_row, textvariable=self.camera_source_var, width=22, state="readonly",
-            postcommand=self._refresh_camera_sources,
-        )
-        self.camera_combo.pack(side="left", padx=(8, 0))
-        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_source)
-
-        self.camera_label = ttk.Label(video_group)
-        self.camera_label.pack()
-
-        # Below the camera pane, in the same column: a subclass with a second video
-        # source stacks it under the live one rather than competing for width.
-        self._build_extra_video_panel(camera_frame)
+        # Beside the live column: a subclass with its own video source gets a
+        # column of its own, so its panes line up row-for-row with the live ones
+        # instead of pushing them off the bottom of the window.
+        self._build_extra_video_panel(main_row)
 
         right = ttk.Frame(main_row, padding=(8, 16, 16, 16))
         right.pack(side="left", fill="y")
@@ -689,9 +706,9 @@ class DeployApp(RobotAppBase):
 
         self._begin_policy_load()
 
-        if not self._open_camera(self._camera_source):
-            self._log("Pick another source from the Camera dropdown, or run "
-                      "stream_camera.py elsewhere and choose Remote.", level="warn")
+        if len(self._open_active_cameras()) < self.camera_count and self._wants_cameras():
+            self._log("Pick another source from a Camera dropdown, drop to fewer views, "
+                      "or run stream_camera.py elsewhere and choose Remote.", level="warn")
 
         self.after(0, self._update_camera_feed)
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
@@ -750,23 +767,43 @@ class DeployApp(RobotAppBase):
         """More controls, below the policy section."""
 
     def _policy_observation(self):
-        """(rgb, meta) for this tick, or (None, None) if there is no frame yet.
+        """(rgbs, meta) for this tick, or (None, None) if a view has no frame yet.
 
-        `rgb` is what the policy sees, at self.image_size; `meta` labels where it
-        came from and rides along with every action predicted from it.
+        `rgbs` is what the policy sees -- one frame per image key it declares, in
+        slot order, at self.image_size; `meta` labels where they came from and
+        rides along with every action predicted from them. All or nothing: a tick
+        missing one of two views would pair a fresh front image with nothing at
+        all, which is not an observation the policy has ever seen.
         """
-        latest = self.camera.get_latest() if self.camera is not None else None
-        if latest is None:
-            return None, None
-        return resize_keep_aspect(latest[0], self.image_size), None
+        rgbs = []
+        for slot in range(self._policy_view_count()):
+            camera = self.cameras[slot] if slot < len(self.cameras) else None
+            latest = camera.get_latest() if camera is not None else None
+            if latest is None:
+                return None, None
+            rgbs.append(resize_keep_aspect(latest[0], self.image_size))
+        return rgbs, None
+
+    def _policy_view_count(self):
+        """How many views to submit: the checkpoint's count, or the panes' until
+        one is loaded."""
+        if self.runner is not None:
+            return len(self.runner.image_keys)
+        return self.camera_count
 
     def _observation_ready(self):
         """Why the policy cannot be started yet, or None.
 
         Starting blind would drive the arm from whatever frame arrives first.
         """
-        if self.camera is None or self.camera.get_latest() is None:
-            return "No camera frame yet -- wait for the feed before starting."
+        needed = self._policy_view_count()
+        if needed > self.camera_count:
+            return (f"This checkpoint expects {needed} camera views but only "
+                    f"{self.camera_count} is selected -- add the second view.")
+        missing = [camera_label(i) for i in range(needed)
+                   if self.cameras[i] is None or self.cameras[i].get_latest() is None]
+        if missing:
+            return f"No frame from {', '.join(missing)} yet -- wait for the feed before starting."
         return None
 
     def _extra_log_fields(self):
@@ -790,6 +827,8 @@ class DeployApp(RobotAppBase):
             "policy_type": self.runner.policy_type if self.runner else None,
             "device": self.runner.device if self.runner else None,
             "image_size": list(self.image_size),
+            "camera_views": self.camera_count,
+            "policy_image_keys": list(self.runner.image_keys) if self.runner else None,
             "git_sha": git_sha(),
         }
 
@@ -916,14 +955,16 @@ class DeployApp(RobotAppBase):
         elif self._policy_loading:
             self.policy_status_var.set("Loading checkpoint...")
             self.policy_detail_var.set(
-                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
+                f"{self.camera_count} view(s)  ·  cameras {self._slowest_camera_fps():.1f} fps"
+                f"  ·  {self._link_readout()}"
             )
         else:
             self.policy_status_var.set(
                 "Recording (manual control)." if self._recording else "Manual control."
             )
             self.policy_detail_var.set(
-                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
+                f"{self.camera_count} view(s)  ·  cameras {self._slowest_camera_fps():.1f} fps"
+                f"  ·  {self._link_readout()}"
             )
 
     # -- policy lifecycle --------------------------------------------------
@@ -975,11 +1016,14 @@ class DeployApp(RobotAppBase):
             self._log(f"Could not load checkpoint: {error}", level="error")
         else:
             self.runner = runner
+            views = len(runner.image_keys)
             self._log(f"Checkpoint ready in {time.monotonic() - self._load_started:.0f}s: "
                       f"{runner.policy_type} on {runner.device}, "
+                      f"{views} camera view(s), "
                       f"{runner.n_action_steps} actions per inference"
                       f"{', RTC available' if runner.supports_rtc else ', no RTC'}",
                       level="connected")
+            self._check_policy_views(views)
             if runner.stats_warning:
                 self._log(runner.stats_warning, level="warn")
             if self.args.rtc and not runner.supports_rtc:
@@ -988,6 +1032,19 @@ class DeployApp(RobotAppBase):
             self._rtc_var.set(bool(runner.rtc_enabled))
         self._set_policy_buttons_state()
         self._update_status_label()
+
+    def _check_policy_views(self, views):
+        """Say when the observation source and the checkpoint disagree on how many
+        views there are. A mismatch either way is otherwise silent: extra views are
+        ignored, missing ones are an observation the policy has never seen."""
+        if views > self.camera_count:
+            self._log(f"This checkpoint reads {views} camera views but "
+                      f"{self.camera_count} is selected -- switch to {views} views.",
+                      level="warn")
+        elif views < self.camera_count:
+            self._log(f"This checkpoint reads only {views} camera view(s); "
+                      f"{', '.join(camera_label(i) for i in range(views, self.camera_count))} "
+                      "is shown but not sent to it.", level="warn")
 
     def _start_policy(self):
         if self._policy_running:
@@ -1067,10 +1124,10 @@ class DeployApp(RobotAppBase):
             self._stop_policy(reason="inference error")
             return
 
-        rgb, meta = self._policy_observation()
-        if rgb is None:
+        rgbs, meta = self._policy_observation()
+        if rgbs is None:
             return
-        self.runner.submit_frame(rgb, meta)
+        self.runner.submit_frame(rgbs, meta)
 
         popped = self.runner.pop()
         underrun = popped is None
@@ -1103,7 +1160,7 @@ class DeployApp(RobotAppBase):
                 # stop_all leaves the gripper where it is, so only 0-2 zero.
                 self._current_action[0:3] = 0.0
                 self._note_action(raw=None, dispatched=self._current_action,
-                                  underrun=True, frame=rgb)
+                                  underrun=True, frames=rgbs)
                 return
             # A held action is still the one predicted from its original frame, so
             # its label carries over rather than going blank for the held ticks.
@@ -1119,20 +1176,25 @@ class DeployApp(RobotAppBase):
         dispatch_action(self.bus, action, CHANNELS, last=self._last_dispatched)
         self._last_dispatched = np.asarray(action, dtype=np.float32).copy()
         self._current_action[:] = action
-        self._note_action(raw=raw, dispatched=action, underrun=underrun, frame=rgb)
+        self._note_action(raw=raw, dispatched=action, underrun=underrun, frames=rgbs)
         self._tick_index += 1
         if self._tick_index % max(1, self.args.fps // 5) == 0:
             self._update_status_label()
 
     # -- action history, plots, recording ----------------------------------
 
-    def _note_action(self, raw, dispatched, underrun, frame=None):
-        """One place where an action becomes history, a plot point and a log line."""
+    def _note_action(self, raw, dispatched, underrun, frames=None):
+        """One place where an action becomes history, a plot point and a log line.
+
+        `frames` is what the policy was given this tick, one per view; each goes
+        to its own mp4 so the recording is exactly the observation, per camera.
+        """
         self._history.append((time.time(), np.asarray(dispatched, dtype=np.float32).copy()))
         if not self._recording:
             return
-        if frame is not None and self._writer is not None:
-            self._writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        if frames:
+            for writer, frame in zip(self._writers, frames):
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         if self._log_file is None:
             return
         entry = {
@@ -1199,10 +1261,15 @@ class DeployApp(RobotAppBase):
         else:
             raise RuntimeError(f"could not claim a results directory beside {base}")
         h, w = self.image_size
-        self._writer = cv2.VideoWriter(
-            os.path.join(self._result_dir, "video.mp4"),
-            cv2.VideoWriter_fourcc(*"mp4v"), self.args.fps, (w, h),
-        )
+        # One file per view, named for the slot. A single-view run still writes
+        # video_cam1.mp4 rather than a differently named file per camera count.
+        self._writers = [
+            cv2.VideoWriter(
+                os.path.join(self._result_dir, f"video_cam{slot + 1}.mp4"),
+                cv2.VideoWriter_fourcc(*"mp4v"), self.args.fps, (w, h),
+            )
+            for slot in range(self._policy_view_count())
+        ]
         self._log_file = open(os.path.join(self._result_dir, "actions.jsonl"), "w")
         with open(os.path.join(self._result_dir, "run.json"), "w") as f:
             json.dump({**self._run_metadata(), "started": stamp}, f, indent=2)
@@ -1211,9 +1278,9 @@ class DeployApp(RobotAppBase):
 
     def _close_results(self):
         self._recording = False
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
+        for writer in self._writers:
+            writer.release()
+        self._writers = []
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
@@ -1312,31 +1379,26 @@ class DeployApp(RobotAppBase):
         self._feed_ticks += 1
         if not self._policy_running and self._feed_ticks % max(1, 1000 // FEED_REFRESH_MS) == 0:
             self._update_status_label()
-        latest = self.camera.get_latest() if self.camera is not None else None
+        for slot in self._active_slots():
+            self._draw_camera_pane(slot)
+
+    def _draw_camera_pane(self, slot):
+        camera = self.cameras[slot]
+        latest = camera.get_latest() if camera is not None else None
         if latest is None:
-            self._show_camera_placeholder()
+            self._show_camera_placeholder(slot)
             return
-        self._note_camera_connected()
+        self._note_camera_connected(slot)
         frame = latest[0]
         h, w = frame.shape[:2]
         width = self._display_width
-        small = cv2.resize(frame, (width, int(h * (width / w))), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(frame, (width, max(1, int(h * (width / w)))),
+                           interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        label = "policy" if self._policy_running else "manual"
-        cv2.putText(rgb, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (255, 255, 255), 2, cv2.LINE_AA)
-        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.camera_label.configure(image=photo)
-        self.camera_label.image = photo
-
-    def _show_camera_placeholder(self):
-        canvas = camera_source.placeholder_frame(
-            self.image_size, self.camera, self._camera_source,
-            self.args.remote_camera_port, self._display_width,
-        )
-        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
-        self.camera_label.configure(image=photo)
-        self.camera_label.image = photo
+        mode = "policy" if self._policy_running else "manual"
+        cv2.putText(rgb, f"{camera_label(slot)} - {mode}", (12, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        self._set_pane_image(slot, rgb)
 
     # -- teardown ----------------------------------------------------------
 
@@ -1360,11 +1422,8 @@ class DeployApp(RobotAppBase):
         if self.link is not None:
             link, self.link = self.link, None
             self._close_link_quietly(link, reset_board=True)
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
+        for slot in range(MAX_CAMERAS):
+            self._close_camera(slot)
         self.destroy()
 
 

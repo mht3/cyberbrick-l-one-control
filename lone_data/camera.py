@@ -73,12 +73,19 @@ class CameraStream:
 
     @property
     def measured_fps(self):
-        """Rolling capture rate over the last _FPS_WINDOW frames."""
+        """Rolling capture rate over the last _FPS_WINDOW frames, decaying to zero.
+
+        Measured to *now* rather than to the newest frame. A camera that has
+        stopped delivering must read as slowing down and then as zero -- averaging
+        only over the frames it did deliver leaves a dead camera reporting the rate
+        it managed before it died, for as long as the app stays open, which is
+        exactly when the readout is being relied on.
+        """
         with self._lock:
             recent = self._recent
             if len(recent) < 2:
                 return 0.0
-            span = recent[-1] - recent[0]
+            span = time.monotonic() - recent[0]
             return (len(recent) - 1) / span if span > 0 else 0.0
 
     def stop(self):

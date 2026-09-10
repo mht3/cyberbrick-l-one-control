@@ -5,6 +5,12 @@ Teleoperates the robot exactly like virtual_gripper.py (same link classes, same
 joint keybindings) while recording demonstrations straight into a standard
 LeRobotDataset. See lone_data/features.py for the schema.
 
+Records one or two camera views -- Cam1 (front) and Cam2 (side) -- both written
+to the same dataset, one video column each, sampled on the same frame index so
+the two views never drift apart. Two views are the default when two cameras are
+there; the count is a toolbar setting, and a one-camera session records exactly
+the dataset it always did.
+
 Robot commands go through a CommandBus worker thread rather than being sent
 from the Tk main thread, so a slow board can't stall frame capture -- that is
 what held the previous recorder to ~14.8 Hz.
@@ -24,7 +30,6 @@ from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
 
 from virtual_gripper import (
     AP_FIXED_IP,
@@ -57,37 +62,63 @@ from lone_data.command_bus import CommandBus
 from lone_data.features import (
     ACTION_DIM,
     ACTION_NAMES,
-    CAMERA_KEY,
     DEFAULT_IMAGE_SIZE,
+    MAX_CAMERAS,
+    camera_label,
     resize_keep_aspect,
 )
-from lone_data.lerobot_recorder import LoneRecorder, has_saved_episodes
+from lone_data.lerobot_recorder import LoneRecorder, dataset_num_cameras, has_saved_episodes
 from lone_data.playback import EpisodeVideo
 from lone_data.dataset_edit import delete_episode, set_episode_task
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DISPLAY_MAX_WIDTH = 640
+# Ticks a view may repeat its last frame before it is called stuck. At 25fps this
+# is ~0.6s -- long enough that a camera merely running below the record rate does
+# not trip it, short enough to catch a dead one within an episode.
+STUCK_VIEW_TICKS = 15
 FEED_REFRESH_MS = 50  # ~20Hz preview; deliberately below the record rate so the
                       # preview never competes with the record tick for the main thread
 
 
 def list_cameras(max_index=6):
     print(f"Probing camera indices 0..{max_index - 1}:")
+    found = []
     for i in range(max_index):
         cap = cv2.VideoCapture(i)
-        if cap.isOpened():
+        # isOpened() alone is not enough, and must not be: a UVC camera exposes a
+        # metadata node beside its capture node that opens and never delivers.
+        # available_sources() requires a real frame, so this has to as well or the
+        # two disagree about what the app will actually use.
+        ok = cap.isOpened() and cap.read()[0]
+        if ok:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"  index {i}: opened, reports {w}x{h}")
+            print(f"  index {i}: delivers frames, reports {w}x{h}")
+            found.append(i)
+        elif cap.isOpened():
+            print(f"  index {i}: opens but delivers no frame (not a capture device)")
         else:
             print(f"  index {i}: not available")
         cap.release()
+    views = min(len(found), MAX_CAMERAS)
+    if not views:
+        print("\nNo cameras found -- run with --remote-camera and stream one in, "
+              "or check that nothing else holds the device.")
+        return
+    print(f"\n{len(found)} camera(s) found -- a default run would record "
+          f"{views} view(s): "
+          + ", ".join(f"{camera_label(s)} = index {found[s]}" for s in range(views)))
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--camera-index", type=int, default=0, help="cv2.VideoCapture index (see --list-cameras)")
+    p.add_argument("--camera-index", type=int, nargs="+", default=[0, 1], metavar="INDEX",
+                   help="cv2.VideoCapture index per camera view, Cam1 first "
+                        "(see --list-cameras)")
+    p.add_argument("--cameras", type=int, default=None, choices=range(1, MAX_CAMERAS + 1),
+                   help=f"how many camera views to record (default: as many as are "
+                        f"connected, up to {MAX_CAMERAS})")
     p.add_argument("--list-cameras", action="store_true", help="probe camera indices and exit")
     p.add_argument("--width", type=int, default=1280, help="requested camera capture width")
     p.add_argument("--height", type=int, default=720, help="requested camera capture height")
@@ -96,9 +127,10 @@ def parse_args():
                    help="receive camera frames over the network (see stream_camera.py) instead of "
                         "opening a local camera")
     p.add_argument("--remote-camera-port", type=int, default=8267,
-                   help="port to listen on for --remote-camera")
+                   help="base port to listen on for --remote-camera; Cam2 uses the next "
+                        "port up (see stream_camera.py)")
     p.add_argument("--fps", type=int, default=25, help="dataset recording rate")
-    p.add_argument("--repo-id", default="lone/l_one_manipulation", help="LeRobot dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_manipulation_multiview", help="LeRobot dataset repo id")
     p.add_argument("--root", default=None, help="dataset directory (default: data/lerobot/<repo-id>)")
     p.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1],
                    help="frame width stored in the dataset (must match the camera's aspect ratio)")
@@ -114,7 +146,8 @@ class CollectDataApp(RobotAppBase):
         self.args = args
         self.title("CyberBrick L-ONE Data Collector")
         self.configure(background=PALETTE["bg"])
-        self.minsize(1100, 720)
+        # Sized for two stacked camera panes; one view just leaves slack.
+        self.minsize(1150, 860)
         self._setup_style()
 
         # -- robot link state --------------------------------------------
@@ -139,18 +172,27 @@ class CollectDataApp(RobotAppBase):
         )
         self.bus.start()
 
-        # -- camera -------------------------------------------------------
+        # -- cameras ------------------------------------------------------
         # Selected from the toolbar and swappable at runtime, so a machine with no
         # local camera still opens -- pick the remote source and carry on. A failure
         # here is logged rather than fatal for the same reason.
-        self.camera = None
+        #
+        # Two views by default whenever two cameras answer, so the rig's second
+        # camera is used without being asked for; one when that is all there is.
+        # An existing dataset overrules both, since its camera count is already
+        # fixed and a session that cannot append to it is worse than one that
+        # opens with the wrong number of panes.
+        count = args.cameras or camera_source.detect_camera_count(
+            MAX_CAMERAS, prefer_remote=args.remote_camera)
+        preferred = ([camera_source.REMOTE_SOURCE] * MAX_CAMERAS if args.remote_camera
+                     else list(args.camera_index))
         # Remote is only offered when the app was launched to receive a stream:
         # on a machine nothing streams to, it is a dead menu entry.
-        self._camera_source = camera_source.pick_initial_source(
-            camera_source.REMOTE_SOURCE if args.remote_camera else args.camera_index,
-            include_remote=args.remote_camera,
+        self._init_camera_state(
+            camera_source.pick_initial_sources(
+                preferred, MAX_CAMERAS, include_remote=args.remote_camera),
+            count,
         )
-        self._camera_connected = False
 
         # -- dataset --------------------------------------------------------
         # Not created here. LeRobot writes meta/info.json the moment a dataset
@@ -162,6 +204,12 @@ class CollectDataApp(RobotAppBase):
         root = args.root or os.path.join(REPO_DIR, "data", "lerobot", *args.repo_id.split("/"))
         self.dataset_root = os.path.abspath(root)
         self.recorder = None
+        # A dataset's camera count is fixed the moment it is created, so an
+        # existing one decides how many views this session records -- otherwise
+        # the first Start of an appending session fails on a schema mismatch.
+        self.dataset_cameras = dataset_num_cameras(self.dataset_root)
+        if self.dataset_cameras:
+            self.camera_count = self.dataset_cameras
 
         self.log_dir = os.path.join(REPO_DIR, "logs")
         os.makedirs(self.log_dir, exist_ok=True)
@@ -181,13 +229,17 @@ class CollectDataApp(RobotAppBase):
         self._episode_start_wall = None
         self._episode_task = ""
         self._last_frame_seq = None
+        # Consecutive ticks each view has repeated its last frame, and whether the
+        # operator has already been told about it. Per episode; see _record_tick.
+        self._stale_streak = [0] * MAX_CAMERAS
+        self._stale_warned = [False] * MAX_CAMERAS
         self._feed_ticks = 0
 
         # -- review state --------------------------------------------------
         self._review_mode = False
         self._review_playing = False
         self._review_episode_idx = None
-        self._review_video = None
+        self._review_videos = []   # one EpisodeVideo per camera view
         self._review_len = 0
         self._review_frame_idx = 0
         self._review_frame_interval_ms = max(1, int(1000 * self._period))
@@ -208,19 +260,7 @@ class CollectDataApp(RobotAppBase):
         video_group = ttk.Frame(camera_frame)
         video_group.pack(anchor="n")
 
-        source_row = ttk.Frame(video_group)
-        source_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(source_row, text="Camera").pack(side="left")
-        self.camera_source_var = tk.StringVar(value=self._camera_source_label(self._camera_source))
-        self.camera_combo = ttk.Combobox(
-            source_row, textvariable=self.camera_source_var, width=22, state="readonly",
-            postcommand=self._refresh_camera_sources,
-        )
-        self.camera_combo.pack(side="left", padx=(8, 0))
-        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_source)
-
-        self.camera_label = ttk.Label(video_group)
-        self.camera_label.pack()
+        self._build_camera_panel(video_group)
 
         # Review-only; shown/hidden by _apply_mode_visibility.
         self.scrub_row = ttk.Frame(video_group)
@@ -275,13 +315,18 @@ class CollectDataApp(RobotAppBase):
                 level="warn",
             )
 
+        if self.dataset_cameras:
+            self._log(f"{self.dataset_root} already holds {self.dataset_cameras} camera "
+                      f"view(s) -- recording that many.", level="info")
+
         # After the log panel exists, so a camera that will not open reports itself
         # in the GUI instead of taking the process down before there is a GUI.
-        if self._open_camera(self._camera_source):
+        opened = self._open_active_cameras()
+        if opened:
             self._check_storage_aspect()
-        elif self._camera_source != camera_source.REMOTE_SOURCE:
-            self._log("Pick another source from the Camera dropdown, or run "
-                      "stream_camera.py elsewhere and choose Remote.", level="warn")
+        if len(opened) < self.camera_count:
+            self._log("Pick another source from a Camera dropdown, drop to fewer views, "
+                      "or run stream_camera.py elsewhere and choose Remote.", level="warn")
 
         self.after(0, self._update_camera_feed)
         self.after(WIFI_HEARTBEAT_MS, self._wifi_heartbeat_tick)
@@ -317,31 +362,68 @@ class CollectDataApp(RobotAppBase):
 
     def _after_camera_opened(self):
         self._check_storage_aspect()
+        self._update_camera_count_label()
+
+    def _after_camera_count_changed(self):
+        """Drop an empty recorder whose shape no longer matches the view count.
+
+        The recorder is created on the first Start and fixes its camera columns
+        then. If that episode was discarded nothing was saved, so the count is
+        still free to change -- but the open recorder would keep demanding the old
+        number of frames and fail on the next add_frame(). It has no episodes, so
+        closing it costs nothing and _ensure_recorder rebuilds it to match.
+        """
+        if self.recorder is None or self.recorder.num_cameras == self.camera_count:
+            return
+        if self.recorder.num_episodes:
+            return  # locked; _camera_count_refused should not have allowed this
+        try:
+            self.recorder.close()
+        except Exception as e:
+            self._log(f"Could not reopen the dataset for {self.camera_count} view(s): {e}",
+                      level="error")
+        self.recorder = None
+
+    def _camera_count_refused(self, count):
+        """A dataset's camera count is baked into its schema, so once it holds
+        episodes the number of views is no longer this session's to choose."""
+        if self.dataset_cameras and count != self.dataset_cameras:
+            return (f"{self.dataset_root} already holds episodes with "
+                    f"{self.dataset_cameras} camera view(s); recording {count} would not "
+                    "append to them. Use a different --repo-id for a differently shaped "
+                    "dataset.")
+        return None
 
     def _check_storage_aspect(self):
         """Frames are downscaled, never cropped or padded, so a stored size
-        whose aspect ratio doesn't match the camera's silently stretches every
+        whose aspect ratio doesn't match a camera's silently stretches every
         frame in the dataset. Refuse up front instead.
+
+        Every view is stored at the same size, so every view has to agree with it;
+        a mismatched Cam2 corrupts half the dataset just as thoroughly.
 
         Once the camera is switchable this can no longer exit the process -- the
         operator is mid-session and can simply pick another source -- so a mismatch
         is reported and recording is blocked by _start_episode instead."""
         self._aspect_error = None
-        if self.camera is None:
-            return
         store_h, store_w = self.image_size
-        cam_w, cam_h = self.camera.actual_width, self.camera.actual_height
-        if not cam_w or not cam_h:
-            return
-        if abs((store_w / store_h) - (cam_w / cam_h)) > 0.01:
-            self._aspect_error = (
-                f"--image-width/--image-height {store_w}x{store_h} "
-                f"({store_w / store_h:.3f}:1) does not match the camera's "
-                f"{cam_w}x{cam_h} ({cam_w / cam_h:.3f}:1). "
-                "Frames are scaled, not cropped or padded, so this would distort every frame. "
-                f"Use a size with the camera's aspect ratio (e.g. {cam_w // 2}x{cam_h // 2})."
-            )
-            self._log(self._aspect_error, level="error")
+        for slot in self._active_slots():
+            camera = self.cameras[slot]
+            if camera is None:
+                continue
+            cam_w, cam_h = camera.actual_width, camera.actual_height
+            if not cam_w or not cam_h:
+                continue
+            if abs((store_w / store_h) - (cam_w / cam_h)) > 0.01:
+                self._aspect_error = (
+                    f"--image-width/--image-height {store_w}x{store_h} "
+                    f"({store_w / store_h:.3f}:1) does not match {camera_label(slot)}'s "
+                    f"{cam_w}x{cam_h} ({cam_w / cam_h:.3f}:1). "
+                    "Frames are scaled, not cropped or padded, so this would distort every frame. "
+                    f"Use a size with the camera's aspect ratio (e.g. {cam_w // 2}x{cam_h // 2})."
+                )
+                self._log(self._aspect_error, level="error")
+                return
 
     # -- dataset (created lazily, on the first episode) ------------------
 
@@ -361,11 +443,15 @@ class CollectDataApp(RobotAppBase):
         try:
             os.makedirs(os.path.dirname(self.dataset_root), exist_ok=True)
             self.recorder = LoneRecorder(
-                self.args.repo_id, self.dataset_root, fps=self.args.fps, image_size=self.image_size
+                self.args.repo_id, self.dataset_root, fps=self.args.fps,
+                image_size=self.image_size, num_cameras=self.camera_count,
             )
         except Exception as e:
             self._log(f"Could not open dataset: {e}", level="error")
             return False
+        # Only a dataset with episodes in it constrains the view count; a recorder
+        # that has yet to save one leaves the choice open.
+        self.dataset_cameras = self.recorder.num_cameras if self.recorder.num_episodes else 0
         if self.recorder.resumed:
             self._log(
                 f"Appending to existing dataset ({self.recorder.num_episodes} episode(s), "
@@ -423,8 +509,8 @@ class CollectDataApp(RobotAppBase):
         self.bind("<KeyPress-f>", guarded(self._finish_episode))
         self.bind("<KeyPress-F>", guarded(self._finish_episode))
         self.bind("<BackSpace>", guarded(self._discard_episode))
-        self.bind("<KeyPress-q>", guarded(self._quit))
-        self.bind("<KeyPress-Q>", guarded(self._quit))
+        # No Q binding: quitting is the toolbar's Quit button. A letter key that
+        # tears down a session is one stray keystroke away from ending a recording.
         self.bind("<KeyPress-r>", guarded(self._enter_review_mode))
         self.bind("<KeyPress-R>", guarded(self._enter_review_mode))
         self.bind("<KeyPress-p>", guarded(self._toggle_review_play))
@@ -453,7 +539,7 @@ class CollectDataApp(RobotAppBase):
             )
             achieved = self._episode_step_count / elapsed if elapsed > 0 else 0.0
             self.rate_var.set(
-                f"{achieved:.1f}/{self.args.fps} fps  ·  camera {self._camera_fps():.1f} fps  ·  "
+                f"{achieved:.1f}/{self.args.fps} fps  ·  cameras {self._slowest_camera_fps():.1f} fps  ·  "
                 f"missed {self._episode_missed}  ·  stale frames {self._episode_repeats}  ·  "
                 f"{self._link_readout()}"
             )
@@ -462,7 +548,8 @@ class CollectDataApp(RobotAppBase):
                 f"Idle -- {self._n_episodes} episode(s), {self._n_frames} frames"
             )
             self.rate_var.set(
-                f"camera {self._camera_fps():.1f} fps  ·  {self._link_readout()}"
+                f"{self.camera_count} view(s)  ·  cameras {self._slowest_camera_fps():.1f} fps  ·  "
+                f"{self._link_readout()}"
             )
 
     # -- review mode: play back recorded episodes ------------------------
@@ -667,7 +754,7 @@ class CollectDataApp(RobotAppBase):
         self._review_mode = False
         self._set_review_playing(False)
         self._review_episode_idx = None
-        self._review_video = None
+        self._close_review_video()
         self._review_len = 0
         self.review_task_var.set("")
         self.review_slider.config(to=0)
@@ -705,9 +792,12 @@ class CollectDataApp(RobotAppBase):
         self._close_review_video()
         try:
             ep = self.recorder.episodes[episode_idx]
-            self._review_video = EpisodeVideo(
-                ep["video_path"], ep["from_timestamp"], ep["length"], self.args.fps
-            )
+            # One reader per view -- they share a frame index, so the panes step
+            # together and a misalignment between the two would be visible.
+            self._review_videos = [
+                EpisodeVideo(path, start, ep["length"], self.args.fps)
+                for path, start in zip(ep["video_paths"], ep["from_timestamps"])
+            ]
         except Exception as e:
             self._log(f"Could not open episode {episode_idx} video: {e}", level="error")
             self._exit_review_mode()
@@ -724,12 +814,12 @@ class CollectDataApp(RobotAppBase):
         self._render_review_frame()
 
     def _close_review_video(self):
-        if self._review_video is not None:
+        for video in self._review_videos:
             try:
-                self._review_video.close()
+                video.close()
             except Exception:
                 pass
-            self._review_video = None
+        self._review_videos = []
 
     def _set_review_playing(self, playing):
         self._review_playing = playing
@@ -745,29 +835,30 @@ class CollectDataApp(RobotAppBase):
         self._set_review_playing(not self._review_playing)
 
     def _render_review_frame(self):
-        if self._review_len == 0 or self._review_video is None:
+        if self._review_len == 0 or not self._review_videos:
             return
-        try:
-            display = self._review_video.frame(self._review_frame_idx).copy()
-        except Exception as e:
-            self._log(f"Review read failed: {e}", level="error")
-            self._set_review_playing(False)
-            return
-
-        lines = [f"REVIEW episode {self._review_episode_idx:06d}"]
-        actions = self.recorder.episode_actions.get(self._review_episode_idx)
-        if actions is not None and self._review_frame_idx < len(actions):
-            action = actions[self._review_frame_idx]
-            lines += [f"{name}: {action[i]:.1f}" for i, name in enumerate(ACTION_NAMES)]
-        for i, line in enumerate(lines):
-            cv2.putText(display, line, (6, 16 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 0), 1, cv2.LINE_AA)
-
-        h, w = display.shape[:2]
-        scale = DISPLAY_MAX_WIDTH / w
-        display = cv2.resize(display, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_NEAREST)
-        photo = ImageTk.PhotoImage(Image.fromarray(display))
-        self.camera_label.configure(image=photo)
-        self.camera_label.image = photo
+        actions = self.recorder.actions_for(self._review_episode_idx)
+        for slot, video in enumerate(self._review_videos):
+            try:
+                display = video.frame(self._review_frame_idx).copy()
+            except Exception as e:
+                self._log(f"Review read failed: {e}", level="error")
+                self._set_review_playing(False)
+                return
+            lines = [f"REVIEW ep {self._review_episode_idx:06d} - {camera_label(slot)}"]
+            # The action overlay belongs on one pane only -- repeating the same
+            # four numbers beside every view is noise, not confirmation.
+            if slot == 0 and actions is not None and self._review_frame_idx < len(actions):
+                action = actions[self._review_frame_idx]
+                lines += [f"{name}: {action[i]:.1f}" for i, name in enumerate(ACTION_NAMES)]
+            for i, line in enumerate(lines):
+                cv2.putText(display, line, (6, 16 + 14 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35, (255, 200, 0), 1, cv2.LINE_AA)
+            h, w = display.shape[:2]
+            width = self._display_width
+            display = cv2.resize(display, (width, max(1, int(h * (width / w)))),
+                                 interpolation=cv2.INTER_NEAREST)
+            self._set_pane_image(slot, display)
 
         self._sync_review_slider()
         self._update_review_time_label()
@@ -836,45 +927,42 @@ class CollectDataApp(RobotAppBase):
 
     # -- camera feed ------------------------------------------------------
 
-    def _show_camera_placeholder(self):
-        """Stand-in for the video pane when no frames are arriving."""
-        canvas = camera_source.placeholder_frame(
-            self.image_size, self.camera, self._camera_source,
-            self.args.remote_camera_port, DISPLAY_MAX_WIDTH,
-        )
-        photo = ImageTk.PhotoImage(Image.fromarray(canvas))
-        self.camera_label.configure(image=photo)
-        self.camera_label.image = photo
-
     def _update_camera_feed(self):
         self.after(FEED_REFRESH_MS, self._update_camera_feed)
         if self._review_mode:
-            return  # _review_tick owns camera_label while reviewing
+            return  # _review_tick owns the video panes while reviewing
         # The idle readout is otherwise only written at startup, when the camera
         # hasn't produced a frame yet and its rate still reads 0.
         self._feed_ticks += 1
         if not self._recording and self._feed_ticks % max(1, 1000 // FEED_REFRESH_MS) == 0:
             self._update_status_label()
-        latest = self.camera.get_latest() if self.camera is not None else None
+        for slot in self._active_slots():
+            self._draw_camera_pane(slot)
+
+    def _draw_camera_pane(self, slot):
+        camera = self.cameras[slot]
+        latest = camera.get_latest() if camera is not None else None
         if latest is None:
-            self._show_camera_placeholder()
+            self._show_camera_placeholder(slot)
             return
-        self._note_camera_connected()
-        frame, _ts, _seq = latest
+        self._note_camera_connected(slot)
+        frame = latest[0]
         # Downscale first, then annotate -- drawing on the full-res frame costs a
         # 2.7MB copy per refresh on the same thread the record tick runs on.
         h, w = frame.shape[:2]
-        scale = DISPLAY_MAX_WIDTH / w
-        display = cv2.resize(frame, (DISPLAY_MAX_WIDTH, int(h * scale)), interpolation=cv2.INTER_NEAREST)
+        width = self._display_width
+        display = cv2.resize(frame, (width, max(1, int(h * (width / w)))),
+                             interpolation=cv2.INTER_NEAREST)
         if self._recording:
             label, color = f"REC ep{self._n_episodes:06d}  step {self._episode_step_count}", (0, 0, 255)
         else:
             label, color = "idle", (200, 200, 200)
-        cv2.putText(display, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.camera_label.configure(image=photo)
-        self.camera_label.image = photo  # keep a reference, Tk won't otherwise
+        # Both the state and the slot, so a glance at either pane says which view
+        # it is even when the two cameras see similar things. ASCII only: cv2's
+        # Hershey fonts have no glyph past 127 and draw "?" for anything else.
+        cv2.putText(display, f"{camera_label(slot)} - {label}", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        self._set_pane_image(slot, cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
 
     # -- robot command dispatch (also updates self._current_action, which the recorder reads) --
 
@@ -889,11 +977,16 @@ class CollectDataApp(RobotAppBase):
             return
         if not self._require_link():
             return
-        if self.camera is None:
-            self._log("No camera selected -- choose a source from the Camera dropdown.", level="warn")
+        missing = [camera_label(i) for i in self._active_slots() if self.cameras[i] is None]
+        if missing:
+            self._log(f"No camera for {', '.join(missing)} -- choose a source, or drop to "
+                      "fewer camera views.", level="warn")
             return
-        if self.camera.get_latest() is None:
-            self._log("No camera frame available yet -- wait a moment and try again.", level="warn")
+        waiting = [camera_label(i) for i in self._active_slots()
+                   if self.cameras[i].get_latest() is None]
+        if waiting:
+            self._log(f"No frame from {', '.join(waiting)} yet -- wait a moment and try again.",
+                      level="warn")
             return
         if self._aspect_error:
             # Was a SystemExit at startup; with a switchable camera it blocks
@@ -906,10 +999,10 @@ class CollectDataApp(RobotAppBase):
             self.task_entry.focus_set()
             return
 
-        cam_fps = self._camera_fps()
+        cam_fps = self._slowest_camera_fps()
         if cam_fps and cam_fps < self.args.fps * 0.9:
             self._log(
-                f"Camera is only sustaining {cam_fps:.1f} fps but the dataset declares "
+                f"Cameras are only sustaining {cam_fps:.1f} fps but the dataset declares "
                 f"{self.args.fps} -- frames will be duplicated. Restart with --fps {int(cam_fps)}.",
                 level="warn",
             )
@@ -927,6 +1020,8 @@ class CollectDataApp(RobotAppBase):
         self._episode_missed = 0
         self._episode_repeats = 0
         self._last_frame_seq = None
+        self._stale_streak = [0] * MAX_CAMERAS
+        self._stale_warned = [False] * MAX_CAMERAS
         self._episode_start_mono = time.monotonic()
         self._episode_start_wall = datetime.datetime.now().astimezone().isoformat()
         self._episode_task = task
@@ -951,20 +1046,34 @@ class CollectDataApp(RobotAppBase):
         self.after(max(1, int((self._next_deadline - now) * 1000)), self._record_tick)
 
         try:
-            latest = self.camera.get_latest() if self.camera is not None else None
-            if latest is None:
+            latest = [self.cameras[i].get_latest() if self.cameras[i] is not None else None
+                      for i in self._active_slots()]
+            if any(item is None for item in latest):
                 self._log("No camera frame available -- skipped a step", level="warn")
                 return
-            frame, _cam_ts, seq = latest
-            if seq == self._last_frame_seq:
-                # Camera hasn't produced a new frame within one period. Recording
-                # it keeps the fixed-rate grid honest; the count is reported.
-                self._episode_repeats += 1
-            self._last_frame_seq = seq
+            seqs = tuple(item[2] for item in latest)
+            if self._last_frame_seq is not None:
+                # Per view, not across all of them. A camera that stops delivering
+                # keeps handing back its last frame forever, and with two views the
+                # other one goes on advancing -- so a rule that only fires when
+                # *every* view repeats writes a dead camera into the dataset as a
+                # still image and reports zero stale frames while doing it.
+                stale = [i for i, (now, before) in enumerate(zip(seqs, self._last_frame_seq))
+                         if now == before]
+                if stale:
+                    self._episode_repeats += 1
+                for slot in self._active_slots():
+                    if slot in stale:
+                        self._stale_streak[slot] += 1
+                    else:
+                        self._stale_streak[slot] = 0
+                self._warn_about_stuck_views()
+            self._last_frame_seq = seqs
 
             action = self._current_action.copy()
             self.recorder.add_frame(
-                resize_keep_aspect(frame, self.image_size), action, self._episode_task
+                [resize_keep_aspect(item[0], self.image_size) for item in latest],
+                action, self._episode_task,
             )
             self._episode_step_count += 1
             # Refreshing Tk vars is pointless at 30Hz and this is the one thread
@@ -974,6 +1083,24 @@ class CollectDataApp(RobotAppBase):
         except Exception as e:
             self._log(f"Recording tick failed: {e} -- discarding episode", level="error")
             self._discard_episode()
+
+    def _warn_about_stuck_views(self):
+        """Say so, once, when a view stops producing new frames mid-episode.
+
+        A frozen view is not a dropped frame: every tick still records something,
+        the rate readouts stay plausible, and the episode is saved looking normal
+        with half of it a still image. Nothing downstream can detect that, so it
+        has to be caught here, while the operator can still discard the take.
+        """
+        for slot in self._active_slots():
+            if self._stale_streak[slot] < STUCK_VIEW_TICKS or self._stale_warned[slot]:
+                continue
+            self._stale_warned[slot] = True
+            self._log(
+                f"{camera_label(slot)} has not produced a new frame in "
+                f"{self._stale_streak[slot]} ticks -- it is being recorded as a frozen "
+                "image. Discard this episode and check the camera.", level="error",
+            )
 
     def _finish_episode(self):
         if not self._recording:
@@ -996,6 +1123,8 @@ class CollectDataApp(RobotAppBase):
 
         if self.recorder.last_warning:
             self._log(self.recorder.last_warning, level="warn")
+        # An episode is on disk now, so the dataset's shape is fixed from here.
+        self.dataset_cameras = self.recorder.num_cameras
 
         if ep_len == 0:
             self._log("Episode had 0 steps -- nothing saved", level="warn")
@@ -1041,7 +1170,8 @@ class CollectDataApp(RobotAppBase):
             "achieved_fps": round(achieved, 3),
             "missed_deadlines": self._episode_missed,
             "stale_frames": self._episode_repeats,
-            "camera_fps": round(self._camera_fps(), 3),
+            "cameras": self.camera_count,
+            "camera_fps": round(self._slowest_camera_fps(), 3),
             "start_time": self._episode_start_wall,
             "command_bus": {k: (round(v, 4) if isinstance(v, float) else v)
                             for k, v in self.bus.stats().items()},
@@ -1058,7 +1188,7 @@ class CollectDataApp(RobotAppBase):
         self._shutdown()
 
     def _shutdown(self):
-        """Single exit path for the window close button, Q, SIGINT and any
+        """Single exit path for the window close button, Quit, SIGINT and any
         unhandled error. Order matters: stop the robot before anything that
         can block, and always finalize the dataset."""
         if self._shutting_down:
@@ -1091,11 +1221,8 @@ class CollectDataApp(RobotAppBase):
                 link.close()
             except Exception:
                 pass
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
+        for slot in range(MAX_CAMERAS):
+            self._close_camera(slot)
         self._close_review_video()
         if self.recorder is None:
             print("No dataset was created (nothing recorded).", file=sys.stderr)

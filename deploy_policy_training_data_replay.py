@@ -37,11 +37,12 @@ the control experiment, and the first run to make: if the arm cannot pick the ma
 up from the demonstration's own actions, the fault is start pose, timing or hardware,
 and the checkpoint is not what is being measured.
 
-The live camera pane stays, stacked directly above the demo frame -- reality on
-top, demonstration below, the same scene at the same scale so the difference is
-the only thing that draws the eye. None of this means anything unless the arm
-starts where the demonstration started, so scrub to frame 0 and teleoperate the
-real arm until the two agree before pressing Start. `--no-camera` drops the pane.
+The live camera panes stay, in a column beside the demo ones -- reality left,
+demonstration right, Cam1 above Cam2 in both, the same scene at the same scale so
+the difference is the only thing that draws the eye. None of this means anything
+unless the arm starts where the demonstration started, so scrub to frame 0 and
+teleoperate the real arm until the two agree before pressing Start. `--no-camera`
+drops the live column.
 """
 
 import json
@@ -65,6 +66,7 @@ from lone_data.features import (
     ACTION_DIM,
     ACTION_LEVELS,
     ACTION_NAMES,
+    camera_label,
     resize_keep_aspect,
 )
 from lone_data.metrics import classification_scores, snap_to_level_index
@@ -77,9 +79,9 @@ from deploy_policy import (
     validate_checkpoint,
 )
 
-# Two video panes stacked, live camera above the demo, so each gets less height
-# than deploy_policy.py's single 640-wide pane would take.
-PANE_WIDTH = 560
+# Live and demo panes sit side by side, and each column stacks Cam1 over Cam2, so
+# a pane is narrower than deploy_policy.py's single 640-wide one.
+PANE_WIDTH = 440
 # Normalizing the ground-truth error: dim 0 spans +/-900 while dim 3 spans 90, so a
 # raw average would be almost entirely dim 0. Same convention as eval_policy.py.
 SPANS = np.array([hi - lo for lo, hi in ACTION_COMMAND_LIMITS], dtype=np.float64)
@@ -119,6 +121,10 @@ def parse_args():
     args = p.parse_args()
     if args.root is None:
         args.root = default_root(args.repo_id)
+    if args.episode < 0:
+        p.error(f"--episode must be 0 or greater, got {args.episode}")
+    if args.start_frame < 0:
+        p.error(f"--start-frame must be 0 or greater, got {args.start_frame}")
     return args
 
 
@@ -223,9 +229,9 @@ class ReplayApp(DeployApp):
         super().__init__(args)
 
         self.title("CyberBrick L-ONE Policy Deployment -- training-data replay")
-        # Taller than deploy_policy.py rather than wider: the two panes stack.
-        self.minsize(1150, 1000)
-        self._display_width = PANE_WIDTH
+        # Wider than deploy_policy.py rather than taller: live and demo are columns.
+        self.minsize(1500, 900)
+        self._resize_camera_panes()
 
         # The prompt comes from the episode being replayed rather than from
         # checkpoint_task()'s walk to the training dataset. Same string when the
@@ -274,11 +280,23 @@ class ReplayApp(DeployApp):
             self._log(f"Could not verify observation fidelity: {e}", level="warn")
             return
         if diff == 0.0:
-            self._log("Observation check: deploy path reproduces the training tensor exactly.",
-                      level="connected")
+            self._log(f"Observation check: deploy path reproduces the training tensor exactly "
+                      f"on all {self.feed.num_cameras} view(s).", level="connected")
         else:
             self._log(f"Observation check: deploy path differs from the training tensor by "
                       f"{diff:.6f} -- the policy is not seeing what it trained on.", level="error")
+
+    def _check_policy_views(self, views):
+        """The recording, not the alignment cameras, is what the policy is fed here.
+
+        So the count that has to match is the dataset's: a checkpoint reading a
+        different number is handed an observation of the wrong shape, which fails
+        inside the preprocessor with nothing pointing back here.
+        """
+        if views != self.feed.num_cameras:
+            self._log(f"This checkpoint reads {views} camera view(s) but "
+                      f"{self.args.repo_id} holds {self.feed.num_cameras} -- the replay "
+                      "cannot feed it what it trained on.", level="error")
 
     def _check_checkpoint_matches_dataset(self):
         """Say so when the episode being replayed is not from the training run.
@@ -299,18 +317,29 @@ class ReplayApp(DeployApp):
 
     # -- DeployApp hooks ---------------------------------------------------
 
+    def _resize_camera_panes(self):
+        """Two columns of panes, so both are narrower than a single-column GUI's --
+        and the live and demo panes must be the same width or the comparison the
+        whole script exists for is between two differently scaled pictures."""
+        self._display_width = PANE_WIDTH
+
     def _build_extra_video_panel(self, parent):
-        """The demo pane, under the live camera: reality on top, demonstration below."""
-        frame = ttk.Frame(parent, padding=(0, 10, 0, 0))
-        frame.pack(anchor="n")
+        """The demo column, beside the live one: one titled pane per recorded view.
+
+        Same slot names and the same order as the live column, so Cam1 sits
+        opposite Cam1 -- a demo pane that has no live counterpart (or the other way
+        round) is then visible at a glance rather than something to work out.
+        """
+        frame = ttk.Frame(parent, padding=(8, 16, 16, 16))
+        frame.pack(side="left", fill="y")
 
         group = ttk.Frame(frame)
-        group.pack(anchor="n")
+        group.pack(anchor="n", fill="x")
 
         row = ttk.Frame(group)
-        row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="Replay", style="SectionHeading.TLabel").pack(side="left",
-                                                                          padx=(0, 12))
+        row.pack(fill="x", pady=(0, 8))
+        ttk.Label(row, text="Demonstration", style="SectionHeading.TLabel").pack(
+            side="left", padx=(0, 12))
         ttk.Label(row, text="Episode").pack(side="left")
         self.episode_var = tk.StringVar(value=str(self.args.episode))
         self.episode_combo = ttk.Combobox(
@@ -319,13 +348,23 @@ class ReplayApp(DeployApp):
         )
         self.episode_combo.pack(side="left", padx=(8, 0))
         self.episode_combo.bind("<<ComboboxSelected>>", self._on_episode)
-        self.frame_readout_var = tk.StringVar(value="")
-        ttk.Label(row, textvariable=self.frame_readout_var, style="Status.TLabel").pack(
-            side="left", padx=(12, 0)
-        )
+        self.demo_views_var = tk.StringVar(
+            value=f"{self.feed.num_cameras} view(s) recorded")
+        ttk.Label(row, textvariable=self.demo_views_var, style="ModeStatus.TLabel").pack(
+            side="left", padx=(12, 0))
 
-        self.dataset_label = ttk.Label(group)
-        self.dataset_label.pack()
+        self.dataset_labels = []
+        for slot in range(self.feed.num_cameras):
+            pane = ttk.Frame(group)
+            pane.pack(fill="x", pady=(0, 8))
+            ttk.Label(pane, text=camera_label(slot), style="JointName.TLabel").pack(anchor="w")
+            video = ttk.Label(pane)
+            video.pack(anchor="w")
+            self.dataset_labels.append(video)
+
+        self.frame_readout_var = tk.StringVar(value="")
+        ttk.Label(group, textvariable=self.frame_readout_var, style="Status.TLabel").pack(
+            anchor="w")
 
         # Scrubbing is how the arm gets lined up with the demonstration before a run;
         # during one the cursor belongs to the control loop, so the slider follows it
@@ -335,7 +374,7 @@ class ReplayApp(DeployApp):
             command=self._on_scrub,
         )
         self.frame_scale.set(self._cursor)
-        self.frame_scale.pack(fill="x", pady=(6, 0))
+        self.frame_scale.pack(fill="x", pady=(4, 0))
         return frame
 
     def _build_extra_controls(self, parent):
@@ -383,11 +422,26 @@ class ReplayApp(DeployApp):
         ttk.Label(frame, textvariable=self.replay_match_var, style="Status.TLabel").pack(anchor="w")
         return frame
 
-    def _open_camera(self, source):
-        """The alignment camera is optional; the replay never reads from it."""
+    def _wants_cameras(self):
+        return not self.args.no_camera
+
+    def _build_camera_panel(self, parent):
+        """With --no-camera there is no live column at all.
+
+        Leaving it up offered two source dropdowns and two panes reading "choose a
+        source", none of which could ever do anything -- _open_camera is wired to
+        refuse. The demo column becomes the whole video area.
+        """
+        panel = super()._build_camera_panel(parent)
+        if self.args.no_camera:
+            panel.pack_forget()
+        return panel
+
+    def _open_camera(self, source, slot=0):
+        """The alignment cameras are optional; the replay never reads from them."""
         if self.args.no_camera:
             return False
-        return super()._open_camera(source)
+        return super()._open_camera(source, slot)
 
     def _set_policy_buttons_state(self):
         super()._set_policy_buttons_state()
@@ -539,18 +593,32 @@ class ReplayApp(DeployApp):
             return "No dataset loaded."
         if not 0 <= self.args.start_frame < self.feed.length:
             return f"--start-frame must be in 0..{self.feed.length - 1}."
+        # The view counts have to agree before anything starts. _observation()
+        # zips frames against the checkpoint's image keys, and zip truncates --
+        # so a mismatch silently builds an observation with a key missing and
+        # dies inside the preprocessor with nothing pointing back here.
+        if self.runner is not None:
+            expected = len(self.runner.image_keys)
+            if expected != self.feed.num_cameras:
+                return (f"This checkpoint reads {expected} camera view(s) but "
+                        f"{self.args.repo_id} holds {self.feed.num_cameras}.")
         return None
 
     def _policy_observation(self):
-        """The frame at the cursor, advancing it, tagged with the index submitted."""
+        """The frames at the cursor, advancing it, tagged with the index submitted."""
         if not self._advance_cursor():
             return None, None
         lookahead = max(0, int(self._lookahead_var.get()))
         self._submitted_frame = min(self._observed_frame + lookahead, self.feed.length - 1)
-        return self._deploy_path_frame(self._submitted_frame), self._submitted_frame
+        return self._deploy_path_frames(self._submitted_frame), self._submitted_frame
 
-    def _deploy_path_frame(self, index):
-        """A dataset frame carried in through deploy_policy.py's own camera path.
+    def _policy_view_count(self):
+        """The recording decides how many views there are, not the local cameras --
+        the alignment camera is never an observation source here."""
+        return self.feed.num_cameras
+
+    def _deploy_path_frames(self, index):
+        """Dataset frames carried in through deploy_policy.py's own camera path.
 
         Deliberately not the dataset tensor handed straight to the policy: the
         point is to exercise the preprocessing deployment actually runs, so that a
@@ -563,8 +631,10 @@ class ReplayApp(DeployApp):
         it, because that is where a camera's own degradations live -- they are in
         the pixels the resize is handed, not something applied to the tensor.
         """
-        rgb = self.perturb.apply(self.feed.rgb(index))
-        return resize_keep_aspect(rgb[:, :, ::-1].copy(), self.image_size)
+        return [
+            resize_keep_aspect(self.perturb.apply(rgb)[:, :, ::-1].copy(), self.image_size)
+            for rgb in self.feed.rgbs(index)
+        ]
 
     def _extra_log_fields(self):
         source = {"source": self._source_var.get()}
@@ -587,7 +657,11 @@ class ReplayApp(DeployApp):
 
     def _run_metadata(self):
         return {
+            # The recording is the observation source here, so the view count that
+            # describes the run is the dataset's -- the alignment cameras are not
+            # part of it and may not even be open.
             **super()._run_metadata(),
+            "camera_views": self.feed.num_cameras,
             "replay": {
                 "repo_id": self.args.repo_id,
                 "root": self.args.root,
@@ -596,6 +670,7 @@ class ReplayApp(DeployApp):
                 "lookahead": int(self._lookahead_var.get()),
                 "loop": bool(self._loop_var.get()),
                 "source": self._source_var.get(),
+                "dataset_views": self.feed.num_cameras,
                 "dataset_task": self.feed.task,
                 "dataset_fps": self.feed.fps,
                 "episode_frames": self.feed.length,
@@ -667,6 +742,13 @@ class ReplayApp(DeployApp):
         self._gt_history.clear()
 
         if self._source_var.get() == "dataset":
+            # The same gate the policy path goes through: dataset mode still walks
+            # the cursor from --start-frame, so an out-of-range one starts the arm
+            # and immediately runs off the end of the episode.
+            problem = self._observation_ready()
+            if problem:
+                self._log(problem, level="warn")
+                return
             self._start_dataset_replay()
             return
         super()._start_policy()
@@ -716,7 +798,7 @@ class ReplayApp(DeployApp):
         self._last_dispatched = np.asarray(action, dtype=np.float32).copy()
         self._current_action[:] = action
         self._note_action(raw=truth, dispatched=action, underrun=False,
-                          frame=self._deploy_path_frame(self._observed_frame))
+                          frames=self._deploy_path_frames(self._observed_frame))
         self._tick_index += 1
         if self._tick_index % max(1, self.args.fps // 5) == 0:
             self._update_status_label()
@@ -747,13 +829,13 @@ class ReplayApp(DeployApp):
 
     # -- history, status, preview -----------------------------------------
 
-    def _note_action(self, raw, dispatched, underrun, frame=None):
-        # Only ticks where the arm was driven from a dataset frame have a ground
-        # truth to compare against. `frame is None` is what separates those from
+    def _note_action(self, raw, dispatched, underrun, frames=None):
+        # Only ticks where the arm was driven from dataset frames have a ground
+        # truth to compare against. Empty `frames` is what separates those from
         # manual moves and from the entry a run opens with, before its first tick.
         # Set before super(), which is what calls _extra_log_fields().
-        self._is_replay_tick = self._policy_running and frame is not None
-        super()._note_action(raw, dispatched, underrun, frame=frame)
+        self._is_replay_tick = self._policy_running and bool(frames)
+        super()._note_action(raw, dispatched, underrun, frames=frames)
         if not self._is_replay_tick:
             return
         truth = self.feed.action(self._observed_frame)
@@ -789,6 +871,11 @@ class ReplayApp(DeployApp):
     def _on_scrub(self, value):
         if self._policy_running:
             return  # the control loop owns the cursor during a run
+        # The scale is populated while the video panel is built, and setting it to
+        # an out-of-range --start-frame makes ttk clamp the value and fire this --
+        # before _build_extra_controls has created the vars below.
+        if not hasattr(self, "replay_status_var"):
+            return
         index = int(float(value))
         if index == self._observed_frame:
             return
@@ -847,17 +934,16 @@ class ReplayApp(DeployApp):
             return
         self._shown_frame = index
         try:
-            # Perturbed, not clean: the pane has to show what the policy is given.
-            rgb = self.perturb.apply(self.feed.rgb(index))
+            # Perturbed, not clean: the panes have to show what the policy is given.
+            rgbs = [self.perturb.apply(rgb) for rgb in self.feed.rgbs(index)]
         except Exception as e:
             self._log(f"Could not decode frame {index}: {e}", level="error")
             return
-        image = Image.fromarray(rgb).resize(
-            (PANE_WIDTH, max(1, int(self.feed.actual_height * PANE_WIDTH / self.feed.actual_width)))
-        )
-        photo = ImageTk.PhotoImage(image)
-        self.dataset_label.configure(image=photo)
-        self.dataset_label.image = photo
+        height = max(1, int(self.feed.actual_height * PANE_WIDTH / self.feed.actual_width))
+        for label, rgb in zip(self.dataset_labels, rgbs):
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((PANE_WIDTH, height)))
+            label.configure(image=photo)
+            label.image = photo
         self.frame_readout_var.set(
             f"demo frame {index}  ·  t={index / self.feed.fps:.2f}s"
         )

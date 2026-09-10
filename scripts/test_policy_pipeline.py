@@ -25,7 +25,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-from lone_data.features import ACTION_DIM, CAMERA_KEY, STATE_DIM
+from lone_data.features import ACTION_DIM, STATE_DIM, dataset_camera_keys
 
 DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
 
@@ -56,8 +56,9 @@ def main():
 
     ds = LeRobotDataset(args.repo_id, root=args.root)
     features = dataset_to_policy_features(ds.meta.features)
+    cam_keys = dataset_camera_keys(ds.meta.features)
 
-    print("dataset features exposed to policies")
+    print(f"dataset features exposed to policies ({len(cam_keys)} camera view(s))")
     for key, ft in features.items():
         print(f"  {key:32s} {ft.type.name:8s} {tuple(ft.shape)}")
 
@@ -80,10 +81,15 @@ def main():
     print("\npi05 (the intended training path)")
     from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
-    pi05 = wire(PI05Config(empty_cameras=2), features)
+    # pi0.5 declares three camera slots, so the synthetic ones fill whatever this
+    # dataset leaves over -- one view leaves two, two views leave one.
+    spare = max(0, 3 - len(cam_keys))
+    pi05 = wire(PI05Config(empty_cameras=spare), features)
     empty_cams = [k for k in pi05.input_features if "empty_camera" in k]
-    check("PI05Config fills the 2 unused camera slots", len(empty_cams) == 2, str(empty_cams))
-    check("PI05Config sees our camera", CAMERA_KEY in pi05.input_features)
+    check(f"PI05Config fills the {spare} unused camera slots",
+          len(empty_cams) == spare, str(empty_cams))
+    check(f"PI05Config sees all {len(cam_keys)} of our cameras",
+          all(key in pi05.input_features for key in cam_keys))
     check("PI05Config sees our state", OBS_STATE in pi05.input_features)
     check("PI05Config outputs action", ACTION in pi05.output_features)
 
@@ -97,7 +103,7 @@ def main():
     step = Pi05PrepareStateTokenizerProcessorStep(max_state_dim=pi05.max_state_dim)
     transition = {
         TransitionKey.OBSERVATION: {
-            CAMERA_KEY: torch.zeros(1, 3, 224, 224),
+            **{key: torch.zeros(1, 3, 224, 224) for key in cam_keys},
             OBS_STATE: torch.zeros(1, STATE_DIM),
         },
         TransitionKey.COMPLEMENTARY_DATA: {"task": ["Pick up the green marker."]},
@@ -118,7 +124,8 @@ def main():
     # pretrained_backbone_weights would fetch resnet18; keep this script offline.
     act = wire(ACTConfig(pretrained_backbone_weights=None, chunk_size=8, n_action_steps=8,
                          device="cpu"), features)
-    check("ACTConfig sees our camera", CAMERA_KEY in act.input_features)
+    check(f"ACTConfig sees all {len(cam_keys)} of our cameras",
+          all(key in act.input_features for key in cam_keys))
     check(
         "ACTConfig sees our state",
         act.robot_state_feature is not None
@@ -129,7 +136,8 @@ def main():
     act_policy = ACTPolicy(act)
     act_batch = torch.utils.data.default_collate(
         [
-            {CAMERA_KEY: torch.zeros(3, 224, 224), OBS_STATE: torch.zeros(STATE_DIM),
+            {**{key: torch.zeros(3, 224, 224) for key in cam_keys},
+             OBS_STATE: torch.zeros(STATE_DIM),
              ACTION: torch.zeros(act.chunk_size, ACTION_DIM),
              "action_is_pad": torch.zeros(act.chunk_size, dtype=torch.bool)}
             for _ in range(2)
@@ -174,14 +182,19 @@ def main():
         delta_timestamps={"action": [t / ds.meta.fps for t in range(horizon)]},
     )
     batch = torch.utils.data.default_collate([chunked[i] for i in range(min(4, len(chunked)))])
-    img, action = batch[CAMERA_KEY], batch[ACTION]
-    print(f"  {CAMERA_KEY:32s} {tuple(img.shape)} {img.dtype}")
+    action = batch[ACTION]
+    for key in cam_keys:
+        print(f"  {key:32s} {tuple(batch[key].shape)} {batch[key].dtype}")
     print(f"  {ACTION:32s} {tuple(action.shape)} {action.dtype}")
     print(f"  task                             {batch['task'][0]!r}")
 
-    check("image is float32 CHW", img.dtype == torch.float32 and img.shape[1] == 3)
-    check("image values in [0,1]", bool(img.min() >= 0 and img.max() <= 1),
-          f"[{img.min():.3f}, {img.max():.3f}]")
+    # Every view, not just the first: a second camera stored or decoded differently
+    # is exactly the kind of thing that only shows up as a training-time surprise.
+    for key in cam_keys:
+        img = batch[key]
+        check(f"{key} is float32 CHW", img.dtype == torch.float32 and img.shape[1] == 3)
+        check(f"{key} values in [0,1]", bool(img.min() >= 0 and img.max() <= 1),
+              f"[{img.min():.3f}, {img.max():.3f}]")
     check("action chunk shape", tuple(action.shape[1:]) == (horizon, ACTION_DIM),
           str(tuple(action.shape)))
     check("no NaN/Inf", bool(torch.isfinite(img).all() and torch.isfinite(action).all()))

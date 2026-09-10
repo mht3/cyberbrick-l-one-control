@@ -9,7 +9,7 @@ from lerobot.configs.types import FeatureType
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-from lone_data.features import ACTION_DIM, ACTION_NAMES, CAMERA_KEY
+from lone_data.features import ACTION_DIM, ACTION_NAMES, dataset_camera_keys
 
 TIMESTAMP_TOLERANCE_S = 1e-4
 
@@ -26,9 +26,13 @@ def validate_dataset(ds):
     warnings = []
     features = ds.meta.features
 
-    for key in (CAMERA_KEY, ACTION):
-        if key not in features:
-            warnings.append(f"missing canonical feature {key!r} (have: {sorted(features)})")
+    # Whichever views this dataset declares -- one camera and two are both valid,
+    # so the check is "at least one L-ONE camera column", not a fixed key.
+    cam_keys = dataset_camera_keys(features)
+    if not cam_keys:
+        warnings.append(f"no L-ONE camera feature (have: {sorted(features)})")
+    if ACTION not in features:
+        warnings.append(f"missing canonical feature {ACTION!r} (have: {sorted(features)})")
     if warnings:
         return warnings
 
@@ -49,11 +53,18 @@ def validate_dataset(ds):
     if list(action_ft.get("names") or []) != ACTION_NAMES:
         warnings.append(f"action names {action_ft.get('names')} != {ACTION_NAMES}")
 
-    cam_ft = features[CAMERA_KEY]
-    if cam_ft["dtype"] not in ("video", "image"):
-        warnings.append(f"{CAMERA_KEY} dtype {cam_ft['dtype']} is not video/image")
-    if len(cam_ft["shape"]) != 3:
-        warnings.append(f"{CAMERA_KEY} shape {cam_ft['shape']} is not 3-dimensional")
+    shapes = set()
+    for key in cam_keys:
+        cam_ft = features[key]
+        if cam_ft["dtype"] not in ("video", "image"):
+            warnings.append(f"{key} dtype {cam_ft['dtype']} is not video/image")
+        if len(cam_ft["shape"]) != 3:
+            warnings.append(f"{key} shape {cam_ft['shape']} is not 3-dimensional")
+        shapes.add(tuple(cam_ft["shape"]))
+    # Every view is stored at one size, which is what lets a single --image-width
+    # describe the dataset and what the replay's fidelity check assumes.
+    if len(shapes) > 1:
+        warnings.append(f"camera views have differing shapes: {sorted(shapes)}")
 
     warnings += _check_tasks(ds)
 
@@ -61,16 +72,16 @@ def validate_dataset(ds):
     # to be sound before a frame is touched -- otherwise the sampling below raises
     # instead of reporting, and takes every remaining check down with it.
     if _tasks_resolvable(ds):
-        warnings += _check_frames(ds)
+        warnings += _check_frames(ds, cam_keys)
     else:
         warnings.append("skipped frame checks -- every frame read raises while the "
                         "task table is unusable; rerun once it is repaired")
 
-    warnings += _check_stats(ds)
+    warnings += _check_stats(ds, cam_keys)
     return warnings
 
 
-def _check_stats(ds):
+def _check_stats(ds, cam_keys):
     """A zero std is invisible at training time -- the normalizer just divides by
     1e-8 -- so it has to be checked here. lerobot once overflowed uint8 images into
     a zero std; fixed as of 0.6.1, but cheap to keep watching for."""
@@ -78,13 +89,12 @@ def _check_stats(ds):
     stats = getattr(ds.meta, "stats", None)
     if not stats:
         return ["dataset has no meta/stats.json"]
-    causes = {
-        CAMERA_KEY: "lerobot's uint8 stats overflow is back; image normalization "
-                    "would divide by ~1e-8",
-        ACTION: "every action dimension is constant across the whole dataset, "
-                "so there is nothing for a policy to learn from it",
-    }
-    for key in (CAMERA_KEY, ACTION):
+    image_cause = ("lerobot's uint8 stats overflow is back; image normalization "
+                   "would divide by ~1e-8")
+    causes = {key: image_cause for key in cam_keys}
+    causes[ACTION] = ("every action dimension is constant across the whole dataset, "
+                      "so there is nothing for a policy to learn from it")
+    for key in [*cam_keys, ACTION]:
         if key not in stats:
             warnings.append(f"no statistics recorded for {key!r}")
             continue
@@ -107,7 +117,7 @@ def _episode_table(ds):
     ]
 
 
-def _check_frames(ds):
+def _check_frames(ds, cam_keys):
     warnings = []
     fps = ds.meta.fps
     total = 0
@@ -140,11 +150,13 @@ def _check_frames(ds):
             )
             break
 
-    img = ds[int(idxs[0])][CAMERA_KEY]
-    if img.ndim != 3 or img.shape[0] != 3:
-        warnings.append(f"{CAMERA_KEY} loads as {tuple(img.shape)}, expected channel-first (3,H,W)")
-    if img.dtype != np.dtype("float32") and str(img.dtype) != "torch.float32":
-        warnings.append(f"{CAMERA_KEY} loads as {img.dtype}, expected float32")
+    sample = ds[int(idxs[0])]
+    for key in cam_keys:
+        img = sample[key]
+        if img.ndim != 3 or img.shape[0] != 3:
+            warnings.append(f"{key} loads as {tuple(img.shape)}, expected channel-first (3,H,W)")
+        if img.dtype != np.dtype("float32") and str(img.dtype) != "torch.float32":
+            warnings.append(f"{key} loads as {img.dtype}, expected float32")
 
     return warnings
 

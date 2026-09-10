@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize an L-ONE LeRobotDataset.
 
-    python scripts/inspect_dataset.py [--root data/lerobot/lone/l_one_marker_pickup]
+    python scripts/inspect_dataset.py [--root data/lerobot/lone/l_one_manipulation_multiview --repo-id lone/l_one_manipulation_multiview]
 """
 
 import argparse
@@ -19,16 +19,22 @@ from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.constants import ACTION
 
-from lone_data.features import ACTION_NAMES, ACTION_SEMANTICS, CAMERA_KEY, SYNC_NOTE, ZERO_DISPATCH_CONVENTION
+from lone_data.features import (
+    ACTION_NAMES,
+    ACTION_SEMANTICS,
+    SYNC_NOTE,
+    ZERO_DISPATCH_CONVENTION,
+    dataset_camera_keys,
+)
 from lone_data.validation import describe_state_policy_support
 
-DEFAULT_ROOT = "data/lerobot/lone/l_one_marker_pickup"
+DEFAULT_ROOT = "data/lerobot/lone/l_one_manipulation_multiview"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=DEFAULT_ROOT, help="dataset directory")
-    p.add_argument("--repo-id", default="lone/l_one_marker_pickup", help="dataset repo id")
+    p.add_argument("--repo-id", default="lone/l_one_manipulation_multiview", help="dataset repo id")
     p.add_argument("--frames", type=int, default=3, help="how many frames to load through __getitem__")
     return p.parse_args()
 
@@ -84,11 +90,14 @@ def main():
     print(f"\n  {ZERO_DISPATCH_CONVENTION}")
     print(f"\n  {SYNC_NOTE}")
 
-    print(f"\nloading {args.frames} frame(s) through __getitem__")
+    cam_keys = dataset_camera_keys(ds.meta.features)
+    print(f"\nloading {args.frames} frame(s) through __getitem__ "
+          f"({len(cam_keys)} camera view(s): {', '.join(cam_keys)})")
     for i in np.linspace(0, len(ds) - 1, args.frames).astype(int):
         item = ds[int(i)]
-        img = item[CAMERA_KEY]
-        print(f"  frame {int(i):6d}  {CAMERA_KEY}={tuple(img.shape)} {img.dtype}  "
+        views = "  ".join(f"{key.rsplit('.', 1)[-1]}={tuple(item[key].shape)} {item[key].dtype}"
+                          for key in cam_keys)
+        print(f"  frame {int(i):6d}  {views}  "
               f"action={tuple(np.asarray(item[ACTION]).shape)}  task={item['task']!r}")
 
 

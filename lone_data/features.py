@@ -1,22 +1,55 @@
 """Canonical LeRobot feature schema for L-ONE demonstrations.
 
-L-ONE has one webcam and no proprioception of any kind. `observation.state` holds
-the per-joint angles an encodered arm would report, and is all zeros here, so the
-dataset has the shape every LeRobot policy expects while claiming no sensor
-readings it cannot take -- see STATE_NAMES.
+L-ONE has one or two webcams and no proprioception of any kind.
+`observation.state` holds the per-joint angles an encodered arm would report, and
+is all zeros here, so the dataset has the shape every LeRobot policy expects while
+claiming no sensor readings it cannot take -- see STATE_NAMES.
 
 Feature names come from lerobot.utils.constants because
 dataset_to_policy_features() matches "action" exactly and anything starting
 with "observation", then silently drops every other key -- a differently named
 action column would be invisible to every LeRobot policy.
+
+Two camera views are the default. Slot 0 ("Cam1", front) is the view every
+dataset recorded before the second camera existed, so it keeps its key
+unchanged and a one-camera dataset stays readable everywhere: the camera count
+is whatever keys a dataset actually declares, never an assumption.
 """
 
 import cv2
 
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-CAMERA_KEY = f"{OBS_IMAGES}.front"
+# Slot order is fixed: index 0 is Cam1, index 1 is Cam2. The GUI labels, the
+# dataset keys and the order frames are handed to a policy all come from here,
+# so there is one place that decides which camera is which.
+CAMERA_VIEWS = ("front", "side")
+CAMERA_KEYS = tuple(f"{OBS_IMAGES}.{view}" for view in CAMERA_VIEWS)
+CAMERA_LABELS = ("Cam1", "Cam2")
+MAX_CAMERAS = len(CAMERA_VIEWS)
+# The single-camera key, unchanged from before Cam2 existed.
+CAMERA_KEY = CAMERA_KEYS[0]
 ROBOT_TYPE = "cyberbrick-l-one"
+
+
+def camera_keys(num_cameras=1):
+    """The dataset keys for the first `num_cameras` slots."""
+    return list(CAMERA_KEYS[:num_cameras])
+
+
+def camera_label(slot):
+    """How slot `slot` is named on screen, e.g. "Cam2 (side)"."""
+    return f"{CAMERA_LABELS[slot]} ({CAMERA_VIEWS[slot]})"
+
+
+def dataset_camera_keys(features):
+    """The camera keys a dataset (or a policy config) actually declares, in slot order.
+
+    Never assume the count: a dataset recorded with one camera and one recorded
+    with two are both valid, and reading the keys back is the only way to tell
+    which is in hand.
+    """
+    return [key for key in CAMERA_KEYS if key in features]
 
 # (height, width). Native 16:9, matching the camera, downscaled from 1280x720.
 # Frames are stored at the camera's own aspect ratio and never padded -- see
@@ -177,16 +210,24 @@ SYNC_NOTE = (
 )
 
 
-def lone_features(image_size=DEFAULT_IMAGE_SIZE):
+def lone_features(image_size=DEFAULT_IMAGE_SIZE, num_cameras=1):
     """LeRobot feature dict. LeRobot adds timestamp/frame_index/episode_index/
-    index/task_index itself, so only the robot-specific columns go here."""
+    index/task_index itself, so only the robot-specific columns go here.
+
+    One video column per camera slot, in slot order. A second camera adds a key
+    rather than changing the first, so datasets from either era differ only by
+    what they contain.
+    """
     h, w = image_size
-    return {
-        CAMERA_KEY: {
+    features = {
+        key: {
             "dtype": "video",
             "shape": (h, w, 3),
             "names": ["height", "width", "channel"],
-        },
+        }
+        for key in camera_keys(num_cameras)
+    }
+    features.update({
         OBS_STATE: {
             "dtype": "float32",
             "shape": (STATE_DIM,),
@@ -197,7 +238,8 @@ def lone_features(image_size=DEFAULT_IMAGE_SIZE):
             "shape": (ACTION_DIM,),
             "names": ACTION_NAMES,
         },
-    }
+    })
+    return features
 
 
 def resize_keep_aspect(frame_bgr, image_size=DEFAULT_IMAGE_SIZE):

@@ -894,8 +894,14 @@ class ControllerApp(tk.Tk):
                 on_release()
             self._key_release_after[keysym] = self.after(40, actually_release)
 
-        self.bind(f"<KeyPress-{keysym}>", handle_press)
-        self.bind(f"<KeyRelease-{keysym}>", handle_release)
+        # Both cases: Tk names a letter key by the character it produced, so with
+        # Caps Lock on "w" arrives as "W" and a binding on "w" alone never fires.
+        # _pressed_keys is still keyed on `keysym`, so the pair stays matched even
+        # if the modifier changes mid-hold.
+        variants = (keysym.lower(), keysym.upper()) if len(keysym) == 1 and keysym.isalpha() else (keysym,)
+        for bound in variants:
+            self.bind(f"<KeyPress-{bound}>", handle_press)
+            self.bind(f"<KeyRelease-{bound}>", handle_release)
 
     def _focused_widget_wants_text(self):
         return isinstance(self.focus_get(), (ttk.Entry, ttk.Combobox))

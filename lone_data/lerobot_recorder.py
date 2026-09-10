@@ -20,14 +20,13 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.features import (
     ACTION_DIM,
-    CAMERA_KEY,
     DEFAULT_IMAGE_SIZE,
     ROBOT_TYPE,
     STATE_DIM,
+    camera_keys,
+    dataset_camera_keys,
     lone_features,
 )
-
-
 
 
 def _read_info(root):
@@ -53,6 +52,22 @@ def _first_task(tasks):
 def _first(value):
     """Unwrap a latest_episode field, which holds one-element lists per column."""
     return value[0] if isinstance(value, (list, tuple)) else value
+
+
+def dataset_num_cameras(root):
+    """How many camera views the dataset at `root` holds, or 0 if there is none.
+
+    Read off disk rather than assumed: appending a two-camera session to a
+    one-camera dataset is not something LeRobot can do, so the collector has to
+    know the count before it offers to record.
+    """
+    info = _read_info(root)
+    if info is None or not info.get("total_episodes", 0):
+        # Metadata with no saved episodes is not a dataset to append to -- the
+        # recorder deletes and recreates that directory on the next open, so its
+        # declared view count constrains nothing and must not lock the session.
+        return 0
+    return len(dataset_camera_keys(info.get("features") or {}))
 
 
 def has_saved_episodes(root):
@@ -92,18 +107,21 @@ class LoneRecorder:
     """Owns the dataset for one collection session. Create once, then
     start_episode/add_frame/finish_episode per demonstration, close() at exit."""
 
-    def __init__(self, repo_id, root, fps, image_size=DEFAULT_IMAGE_SIZE, image_writer_threads=8):
+    def __init__(self, repo_id, root, fps, image_size=DEFAULT_IMAGE_SIZE, num_cameras=1,
+                 image_writer_threads=8):
         self.repo_id = repo_id
         self.root = root
         self.fps = fps
         self.image_size = tuple(image_size)
+        self.camera_keys = camera_keys(num_cameras)
+        self.num_cameras = len(self.camera_keys)
         self._episode_open = False
         self._closed = False
         self.episodes = []          # one record per saved episode, for playback
         self.episode_actions = {}   # episode_index -> (T,4) float32, this session only
         self.last_warning = None    # set by finish_episode; the GUI surfaces it
 
-        features = lone_features(self.image_size)
+        features = lone_features(self.image_size, self.num_cameras)
         info = _read_info(root)
 
         # create() writes meta/info.json before the first episode is saved, so a
@@ -134,6 +152,14 @@ class LoneRecorder:
 
     def _check_compatible(self, features):
         existing = self.dataset.meta.features
+        existing_cams = dataset_camera_keys(existing)
+        if existing_cams != self.camera_keys:
+            raise ValueError(
+                f"Existing dataset at {self.root} has {len(existing_cams)} camera view(s) "
+                f"({', '.join(existing_cams) or 'none'}) but this session is recording "
+                f"{self.num_cameras} ({', '.join(self.camera_keys)}) -- select that many "
+                "camera views, or use a different --repo-id"
+            )
         for key, spec in features.items():
             if key not in existing:
                 raise ValueError(f"Existing dataset at {self.root} has no feature {key!r}")
@@ -164,6 +190,43 @@ class LoneRecorder:
     # after each save_episode(). Recording where each episode landed as it is
     # saved is what makes playback possible before quitting.
 
+    def actions_for(self, episode_index):
+        """(T,4) actions for an episode, from this session or read back off disk.
+
+        episode_actions only holds what this recorder object saved, and a task edit
+        or an episode delete closes and reopens the recorder -- which used to make
+        the review overlay go blank for episodes that are still perfectly readable.
+        Read lazily: the parquet is only loadable once finalize() has run, which is
+        true for every episode a resumed dataset already had.
+        """
+        cached = self.episode_actions.get(episode_index)
+        if cached is not None:
+            return cached
+        try:
+            import pyarrow.parquet as pq
+
+            # Straight from the parquet, not through self.dataset: the recorder
+            # holds the dataset open for writing and __getitem__ refuses ("Cannot
+            # read from a dataset that is being recorded"). The files for episodes
+            # already saved are complete, which is the only case this covers.
+            rows = self.dataset.meta.episodes
+            rel = self.dataset.meta.data_path.format(
+                chunk_index=int(rows["data/chunk_index"][episode_index]),
+                file_index=int(rows["data/file_index"][episode_index]),
+            )
+            table = pq.read_table(os.path.join(self.dataset.root, rel),
+                                  columns=["episode_index", ACTION])
+            mask = np.asarray(table["episode_index"]) == episode_index
+            actions = np.stack(
+                [np.asarray(a, dtype=np.float32) for a in table[ACTION].to_pylist()]
+            )[mask]
+            if not len(actions):
+                return None
+        except Exception:
+            return None
+        self.episode_actions[episode_index] = actions
+        return actions
+
     def _load_episode_index(self):
         """Episode records for a dataset being resumed (its metadata is on disk)."""
         episodes = self.dataset.meta.episodes
@@ -176,18 +239,25 @@ class LoneRecorder:
                     "index": int(episodes["episode_index"][i]),
                     "length": int(episodes["length"][i]),
                     "task": _first_task(episodes["tasks"][i]),
-                    "video_path": self._video_path(
-                        int(episodes[f"videos/{CAMERA_KEY}/chunk_index"][i]),
-                        int(episodes[f"videos/{CAMERA_KEY}/file_index"][i]),
-                    ),
-                    "from_timestamp": float(episodes[f"videos/{CAMERA_KEY}/from_timestamp"][i]),
+                    "video_paths": [
+                        self._video_path(
+                            key,
+                            int(episodes[f"videos/{key}/chunk_index"][i]),
+                            int(episodes[f"videos/{key}/file_index"][i]),
+                        )
+                        for key in self.camera_keys
+                    ],
+                    "from_timestamps": [
+                        float(episodes[f"videos/{key}/from_timestamp"][i])
+                        for key in self.camera_keys
+                    ],
                 }
             )
         return out
 
-    def _video_path(self, chunk_index, file_index):
+    def _video_path(self, video_key, chunk_index, file_index):
         rel = self.dataset.meta.video_path.format(
-            video_key=CAMERA_KEY, chunk_index=chunk_index, file_index=file_index
+            video_key=video_key, chunk_index=chunk_index, file_index=file_index
         )
         return os.path.join(self.dataset.root, rel)
 
@@ -204,11 +274,17 @@ class LoneRecorder:
                 "index": int(first("episode_index")),
                 "length": int(first("length")),
                 "task": task,
-                "video_path": self._video_path(
-                    int(first(f"videos/{CAMERA_KEY}/chunk_index")),
-                    int(first(f"videos/{CAMERA_KEY}/file_index")),
-                ),
-                "from_timestamp": float(first(f"videos/{CAMERA_KEY}/from_timestamp")),
+                "video_paths": [
+                    self._video_path(
+                        key,
+                        int(first(f"videos/{key}/chunk_index")),
+                        int(first(f"videos/{key}/file_index")),
+                    )
+                    for key in self.camera_keys
+                ],
+                "from_timestamps": [
+                    float(first(f"videos/{key}/from_timestamp")) for key in self.camera_keys
+                ],
             }
         )
         # Actions are tiny (4 floats/frame) and the parquet is unreadable until
@@ -225,19 +301,30 @@ class LoneRecorder:
         self._pending_actions = []
         self._pending_task = None
 
-    def add_frame(self, rgb, action, task):
-        """rgb: (H,W,3) uint8 already resized to image_size. action: (4,) float32."""
+    def add_frame(self, rgbs, action, task):
+        """rgbs: one (H,W,3) uint8 frame per camera slot, in slot order, already
+        resized to image_size. action: (4,) float32.
+
+        Every camera contributes to the same frame index, so a slot that has no
+        frame this tick is a caller error rather than something to fill in: the
+        views would drift out of step in a way nothing downstream could detect.
+        """
         if not self._episode_open:
             raise RuntimeError("No episode is being recorded")
         action = np.asarray(action, dtype=np.float32)
         if action.shape != (ACTION_DIM,):
             raise ValueError(f"Action shape {action.shape} != ({ACTION_DIM},)")
-        if rgb.shape != (*self.image_size, 3) or rgb.dtype != np.uint8:
-            raise ValueError(f"Frame {rgb.shape}/{rgb.dtype} != {(*self.image_size, 3)}/uint8")
+        if len(rgbs) != self.num_cameras:
+            raise ValueError(f"Got {len(rgbs)} frames, expected {self.num_cameras}")
+        for rgb in rgbs:
+            if rgb.shape != (*self.image_size, 3) or rgb.dtype != np.uint8:
+                raise ValueError(f"Frame {rgb.shape}/{rgb.dtype} != {(*self.image_size, 3)}/uint8")
 
         # Always zeros -- L-ONE measures nothing. See STATE_NAMES in features.py.
         state = np.zeros(STATE_DIM, dtype=np.float32)
-        self.dataset.add_frame({CAMERA_KEY: rgb, OBS_STATE: state, ACTION: action, "task": task})
+        frame = dict(zip(self.camera_keys, rgbs))
+        frame.update({OBS_STATE: state, ACTION: action, "task": task})
+        self.dataset.add_frame(frame)
         self._pending_actions.append(action)
         self._pending_task = task
         self._frames += 1
@@ -275,23 +362,29 @@ class LoneRecorder:
         """
         ep = self.dataset.meta.latest_episode
         try:
-            span = float(_first(ep[f"videos/{CAMERA_KEY}/to_timestamp"])) - float(
-                _first(ep[f"videos/{CAMERA_KEY}/from_timestamp"])
-            )
             length = int(_first(ep["length"]))
             index = int(_first(ep["episode_index"]))
+            spans = [
+                float(_first(ep[f"videos/{key}/to_timestamp"]))
+                - float(_first(ep[f"videos/{key}/from_timestamp"]))
+                for key in self.camera_keys
+            ]
         except (KeyError, TypeError, IndexError):
             return None  # metadata shape changed; not worth failing a save over
 
         expected = length / self.fps
-        if abs(span - expected) <= 1.0 / self.fps:
-            return None
-        return (
-            f"episode {index:06d} occupies {span:.2f}s of video but holds {length} "
-            f"frames ({expected:.2f}s) -- {span - expected:+.2f}s of stray footage was "
-            "encoded into it, most likely frames left over from a discarded take. "
-            "The dataset is still readable, but delete_episodes() will refuse it."
-        )
+        # Every camera writes its own video file, so stray footage can land in one
+        # and not another -- report whichever drifted rather than only the first.
+        for key, span in zip(self.camera_keys, spans):
+            if abs(span - expected) <= 1.0 / self.fps:
+                continue
+            return (
+                f"episode {index:06d} occupies {span:.2f}s of {key} video but holds {length} "
+                f"frames ({expected:.2f}s) -- {span - expected:+.2f}s of stray footage was "
+                "encoded into it, most likely frames left over from a discarded take. "
+                "The dataset is still readable, but delete_episodes() will refuse it."
+            )
+        return None
 
     def discard_episode(self):
         if not self._episode_open:

@@ -70,7 +70,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from lone_data.checkpoints import default_root, same_dataset, training_dataset
 from lone_data.features import (
@@ -78,6 +78,7 @@ from lone_data.features import (
     ACTION_LEVEL_LABELS,
     ACTION_LEVELS,
     ACTION_NAMES,
+    dataset_camera_keys,
 )
 from lone_data.metrics import score_dimension, verdict
 
@@ -144,7 +145,10 @@ def build_dataset(args, cfg, fps):
     """delta_timestamps mirrors what the training run used, read off the checkpoint."""
     delta = {ACTION: [i / fps for i in cfg.action_delta_indices]}
     if getattr(cfg, "observation_delta_indices", None):
-        for key in ("observation.images.front", "observation.state"):
+        # The checkpoint's own image keys, so a two-camera policy gets a delta for
+        # both views and a one-camera policy is unaffected.
+        keys = [*dataset_camera_keys(getattr(cfg, "input_features", {}) or {}), OBS_STATE]
+        for key in keys:
             delta[key] = [i / fps for i in cfg.observation_delta_indices]
     episodes = None
     if args.episodes:

@@ -19,9 +19,13 @@ collector-specific reaches replaced by hooks a subclass overrides:
     _update_status_label()   the app's own status line
     _on_action_changed()     _current_action was just written to
 
-A subclass must, before calling _build_*: set self.args, self.camera = None,
-self._camera_source, self._camera_connected, self.link = None, self.bus, and
-self._current_action.
+A subclass must, before calling _build_*: set self.args, self.link = None,
+self.bus, self.image_size, self._current_action, and call _init_camera_state()
+with the per-slot sources and the number of views to open.
+
+Cameras are plural throughout: up to MAX_CAMERAS slots, Cam1 (front) and Cam2
+(side), each with its own source dropdown and its own video pane, built by
+_build_camera_panel(). self.camera is slot 0.
 """
 
 import queue
@@ -31,7 +35,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-import numpy as np
+from PIL import Image, ImageTk
 
 from virtual_gripper import (
     AP_FIXED_IP,
@@ -58,7 +62,7 @@ from virtual_gripper import (
 )
 
 from lone_data import camera_source
-from lone_data.features import ACTION_DIM
+from lone_data.features import MAX_CAMERAS, camera_label
 
 # Comfortably under wifi_bridge.py's COMMAND_DEADMAN_TIMEOUT (a single global timer).
 WIFI_HEARTBEAT_MS = 200
@@ -68,6 +72,11 @@ WIFI_HEARTBEAT_MS = 200
 # are failing for a persistent reason and burn through it instead.
 HEALTHY_LINK_SECONDS = 10.0
 MAX_AUTO_RECONNECTS = 3
+
+# Video panes stack, so two views get a narrower one each and the window keeps the
+# same footprint whichever count is selected.
+CAMERA_PANE_WIDTH_1 = 640
+CAMERA_PANE_WIDTH_2 = 480
 
 
 def _serial_error_hint(port, exc, ports=()):
@@ -85,6 +94,20 @@ def _serial_error_hint(port, exc, ports=()):
             hint += f" Other ports seen: {', '.join(others)}."
         return hint
     return f"{type(exc).__name__}: {exc}"
+
+
+def _keysym_variants(keysym):
+    """Every keysym Tk may report for one physical key.
+
+    Tk names a letter key by the character it produced, so with Caps Lock on
+    (or Shift held) "w" arrives as "W" and a binding on "w" alone never fires --
+    which is how WASD silently stopped steering the arm. Both cases are bound and
+    share one entry in _pressed_keys, so press/release stay paired even if the
+    modifier changes while the key is down.
+    """
+    if len(keysym) == 1 and keysym.isalpha():
+        return (keysym.lower(), keysym.upper())
+    return (keysym,)
 
 
 def _wifi_error_hint(host, exc):
@@ -138,74 +161,281 @@ class RobotAppBase(tk.Tk):
         # Lets Ctrl+C get delivered promptly -- mainloop() doesn't check for signals on its own.
         self.after(200, self._signal_pump)
 
-    def _camera_fps(self):
-        return self.camera.measured_fps if self.camera is not None else 0.0
+    # -- cameras -----------------------------------------------------------
+    #
+    # There are MAX_CAMERAS slots. `camera_count` of them are live at any moment,
+    # and everything below is indexed by slot: self.cameras[i], self.camera_sources[i],
+    # self.camera_labels[i]. self.camera is slot 0, kept as a property because Cam1
+    # is what a one-camera setup has and what every single-camera call site means.
 
-    def _camera_source_label(self, source):
-        return camera_source.source_label(source, self.args.remote_camera_port)
+    @property
+    def camera(self):
+        """Cam1 -- the front view, and the only one a one-camera setup has."""
+        return self.cameras[0]
 
-    def _refresh_camera_sources(self):
+    def _init_camera_state(self, sources, count):
+        self.cameras = [None] * MAX_CAMERAS
+        self.camera_sources = list(sources) + [None] * (MAX_CAMERAS - len(sources))
+        self._camera_connected = [False] * MAX_CAMERAS
+        self.camera_count = count
+
+    def _active_slots(self):
+        return range(self.camera_count)
+
+    def _remote_port(self, slot):
+        return camera_source.remote_port(self.args.remote_camera_port, slot)
+
+    def _camera_fps(self, slot=0):
+        cam = self.cameras[slot]
+        return cam.measured_fps if cam is not None else 0.0
+
+    def _slowest_camera_fps(self):
+        """The rate the whole rig sustains -- a recording is only as good as its
+        slowest camera, so that is the number worth showing."""
+        rates = [self._camera_fps(i) for i in self._active_slots() if self.cameras[i] is not None]
+        return min(rates) if rates else 0.0
+
+    def _camera_source_label(self, source, slot=0):
+        return camera_source.source_label(source, self._remote_port(slot))
+
+    def _include_remote(self, slot):
+        return (self.args.remote_camera
+                or self.camera_sources[slot] == camera_source.REMOTE_SOURCE)
+
+    def _refresh_camera_sources(self, slot):
+        held = [self.camera_sources[i] for i in self._active_slots()
+                if self.cameras[i] is not None]
         sources = camera_source.available_sources(
-            self._camera_source, self.camera is not None,
-            include_remote=self.args.remote_camera or self._camera_source == camera_source.REMOTE_SOURCE,
+            held, include_remote=self._include_remote(slot),
         )
-        values = [self._camera_source_label(s) for s in sources]
-        current = self._camera_source_label(self._camera_source)
+        values = [self._camera_source_label(s, slot) for s in sources]
+        current = self._camera_source_label(self.camera_sources[slot], slot)
         if current not in values:
             values.insert(0, current)
-        self.camera_combo["values"] = values
+        self.camera_combos[slot]["values"] = values
 
-    def _open_camera(self, source):
-        """Swap to `source`, returning True on success. Never raises: a camera that
-        will not open must leave the app usable so another source can be chosen."""
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            self.camera = None
+    def _open_camera(self, source, slot=0):
+        """Point `slot` at `source`, returning True on success. Never raises: a
+        camera that will not open must leave the app usable so another source can
+        be chosen."""
+        self._close_camera(slot)
+        # Recorded before the attempt, not after it: on failure the slot has to
+        # admit which source it was pointed at, or the dropdown shows the old one,
+        # the clash guard compares against the wrong device, and re-selecting the
+        # source already on screen is rejected as "no change".
+        self.camera_sources[slot] = source
         try:
-            self.camera = camera_source.open_source(
-                source, self.args.remote_camera_port,
+            self.cameras[slot] = camera_source.open_source(
+                source, self._remote_port(slot),
                 self.args.width, self.args.height, self.args.camera_fps,
             )
         except Exception as e:
-            self._log(f"{self._camera_source_label(source)}: {e}", level="error")
+            self._log(f"{camera_label(slot)} {self._camera_source_label(source, slot)}: {e}",
+                      level="error")
             return False
-        self._camera_source = source
         # Cleared so the next frame to arrive announces itself -- for the remote
         # receiver, binding the port says nothing about a sender being there.
-        self._camera_connected = False
+        self._camera_connected[slot] = False
         if source == camera_source.REMOTE_SOURCE:
-            self._log(f"Waiting for a sender on port {self.args.remote_camera_port} "
-                      "(run stream_camera.py on the machine with the camera)")
+            self._log(f"{camera_label(slot)}: waiting for a sender on port "
+                      f"{self._remote_port(slot)} (run stream_camera.py on the machine "
+                      "with the cameras)")
         else:
-            self._log(f"Opened {self._camera_source_label(source)}")
+            self._log(f"{camera_label(slot)}: opened {self._camera_source_label(source, slot)}")
         return True
 
-    def _note_camera_connected(self):
-        """Log the first frame from the current source, once."""
-        if self._camera_connected or self.camera is None:
+    def _close_camera(self, slot):
+        if self.cameras[slot] is None:
             return
-        self._camera_connected = True
-        w, h = self.camera.actual_width, self.camera.actual_height
-        self._log(f"Receiving frames from {self._camera_source_label(self._camera_source)}"
-                  f" ({w}x{h})", level="connected")
+        try:
+            self.cameras[slot].stop()
+        except Exception:
+            pass
+        self.cameras[slot] = None
+        self._camera_connected[slot] = False
 
-    def _on_camera_source(self, event=None):
-        source = camera_source.parse_label(self.camera_source_var.get())
+    def _wants_cameras(self):
+        """Whether this app is supposed to have live cameras at all.
+
+        False for the training-data replay run with --no-camera, whose observation
+        source is a recording -- there, a slot that did not open is the intent
+        rather than something to report.
+        """
+        return True
+
+    def _open_active_cameras(self):
+        """Open every live slot at startup. Returns the slots that came up."""
+        opened = []
+        for slot in self._active_slots():
+            if self._open_camera(self.camera_sources[slot], slot):
+                opened.append(slot)
+        for slot in range(self.camera_count, MAX_CAMERAS):
+            self._close_camera(slot)
+        self._update_camera_count_label()
+        return opened
+
+    def _note_camera_connected(self, slot):
+        """Log the first frame from a slot's current source, once."""
+        if self._camera_connected[slot] or self.cameras[slot] is None:
+            return
+        self._camera_connected[slot] = True
+        cam = self.cameras[slot]
+        self._log(f"{camera_label(slot)}: receiving frames from "
+                  f"{self._camera_source_label(self.camera_sources[slot], slot)} "
+                  f"({cam.actual_width}x{cam.actual_height})", level="connected")
+
+    def _on_camera_source(self, slot):
+        source = camera_source.parse_label(self.camera_source_vars[slot].get())
         if source is None:
             return
-        if source == self._camera_source and self.camera is not None:
+        if source == self.camera_sources[slot] and self.cameras[slot] is not None:
             return
         busy = self._controls_busy()
         if busy:
             self._log(f"{busy} before switching camera.", level="warn")
-            self.camera_source_var.set(self._camera_source_label(self._camera_source))
+            self.camera_source_vars[slot].set(
+                self._camera_source_label(self.camera_sources[slot], slot))
             return
-        if self._open_camera(source):
+        # One device cannot back two views: the second open fails with a driver
+        # error that says nothing about the real cause, and pointing both panes at
+        # one camera is never what was meant anyway. Remote is exempt -- each slot
+        # listens on its own port.
+        clash = next((i for i in self._active_slots()
+                      if i != slot and self.cameras[i] is not None
+                      and self.camera_sources[i] == source
+                      and source != camera_source.REMOTE_SOURCE), None)
+        if clash is not None:
+            self._log(f"{camera_label(clash)} is already using "
+                      f"{self._camera_source_label(source, slot)}.", level="warn")
+            self.camera_source_vars[slot].set(
+                self._camera_source_label(self.camera_sources[slot], slot))
+            return
+        if self._open_camera(source, slot):
             self._after_camera_opened()
-        self.camera_source_var.set(self._camera_source_label(self._camera_source))
+        self.camera_source_vars[slot].set(
+            self._camera_source_label(self.camera_sources[slot], slot))
+
+    def _on_camera_count(self):
+        """1 or 2 views. Two is the default whenever two cameras are there; one is
+        how a single-camera rig -- and every dataset recorded on one -- still works."""
+        count = int(self.camera_count_var.get())
+        if count == self.camera_count:
+            return
+        busy = self._controls_busy()
+        if busy:
+            self._log(f"{busy} before changing the number of camera views.", level="warn")
+            self.camera_count_var.set(str(self.camera_count))
+            return
+        refused = self._camera_count_refused(count)
+        if refused:
+            self._log(refused, level="warn")
+            self.camera_count_var.set(str(self.camera_count))
+            return
+        self.camera_count = count
+        for slot in range(count, MAX_CAMERAS):
+            self._close_camera(slot)
+        for slot in self._active_slots():
+            if self.cameras[slot] is None:
+                self._open_camera(self.camera_sources[slot], slot)
+        self._apply_camera_count()
+        self._log(f"Using {count} camera view{'s' if count > 1 else ''}.", level="info")
+        self._after_camera_count_changed()
+        self._after_camera_opened()
+
+    def _camera_count_refused(self, count):
+        """Why this app cannot switch to `count` views right now, or None."""
+        return None
+
+    def _after_camera_count_changed(self):
+        """The view count just changed; anything shaped by it can catch up here."""
+
+    def _apply_camera_count(self):
+        """Show exactly the panes that are in use, and say how many that is."""
+        for slot in range(MAX_CAMERAS):
+            frame = self.camera_slot_frames[slot]
+            if slot < self.camera_count:
+                frame.pack(fill="x", pady=(0, 8))
+            else:
+                frame.pack_forget()
+        self._resize_camera_panes()
+        self._update_camera_count_label()
+
+    def _update_camera_count_label(self):
+        live = sum(1 for slot in self._active_slots() if self.cameras[slot] is not None)
+        text = f"{self.camera_count} view{'s' if self.camera_count > 1 else ''} selected"
+        if live != self.camera_count:
+            text += f"  ·  {live} open"
+        self.camera_count_status_var.set(text)
+
+    def _resize_camera_panes(self):
+        """Panes stack, so more views means each is narrower. Subclasses that hold
+        their own display width follow this rather than setting one of their own."""
+        self._display_width = (CAMERA_PANE_WIDTH_1 if self.camera_count == 1
+                               else CAMERA_PANE_WIDTH_2)
+
+    def _build_camera_panel(self, parent):
+        """The video column: how many views, then one titled pane per view.
+
+        Shared by both GUIs so Cam1 and Cam2 are named, ordered and sized the same
+        way wherever they appear -- Cam1 (front) above Cam2 (side), always.
+        """
+        panel = ttk.Frame(parent)
+        panel.pack(anchor="n", fill="x")
+
+        count_row = ttk.Frame(panel)
+        count_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(count_row, text="Camera views", style="SectionHeading.TLabel").pack(side="left")
+        self.camera_count_var = tk.StringVar(value=str(self.camera_count))
+        # Left enabled while recording, like the source dropdowns: _on_camera_count
+        # refuses and says why, which reads better than a greyed control that
+        # cannot explain itself.
+        for n in range(1, MAX_CAMERAS + 1):
+            ttk.Radiobutton(
+                count_row, text=str(n), value=str(n),
+                variable=self.camera_count_var, command=self._on_camera_count,
+            ).pack(side="left", padx=(8 if n == 1 else 4, 0))
+        self.camera_count_status_var = tk.StringVar(value="")
+        ttk.Label(count_row, textvariable=self.camera_count_status_var,
+                  style="ModeStatus.TLabel").pack(side="left", padx=(14, 0))
+
+        self.camera_slot_frames = []
+        self.camera_combos = []
+        self.camera_source_vars = []
+        self.camera_labels = []
+        for slot in range(MAX_CAMERAS):
+            frame = ttk.Frame(panel)
+            header = ttk.Frame(frame)
+            header.pack(fill="x", pady=(0, 4))
+            ttk.Label(header, text=camera_label(slot), style="JointName.TLabel").pack(side="left")
+            var = tk.StringVar(
+                value=self._camera_source_label(self.camera_sources[slot] or 0, slot))
+            combo = ttk.Combobox(
+                header, textvariable=var, width=20, state="readonly",
+                postcommand=lambda s=slot: self._refresh_camera_sources(s),
+            )
+            combo.pack(side="left", padx=(10, 0))
+            combo.bind("<<ComboboxSelected>>", lambda e, s=slot: self._on_camera_source(s))
+            video = ttk.Label(frame)
+            video.pack(anchor="w")
+            self.camera_slot_frames.append(frame)
+            self.camera_combos.append(combo)
+            self.camera_source_vars.append(var)
+            self.camera_labels.append(video)
+
+        self._apply_camera_count()
+        return panel
+
+    def _show_camera_placeholder(self, slot):
+        canvas = camera_source.placeholder_frame(
+            self.image_size, self.cameras[slot], self.camera_sources[slot],
+            self._remote_port(slot), self._display_width, name=camera_label(slot),
+        )
+        self._set_pane_image(slot, canvas)
+
+    def _set_pane_image(self, slot, rgb):
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.camera_labels[slot].configure(image=photo)
+        self.camera_labels[slot].image = photo  # keep a reference, Tk won't otherwise
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -276,8 +506,10 @@ class RobotAppBase(tk.Tk):
         self._transport_row = ttk.Frame(bar)
         self._transport_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # Mode-independent -- stay reachable in both Collect and Review.
-        ttk.Button(bar, text="Quit (Q)", command=self._quit).grid(row=0, column=2, sticky="e", padx=(10, 0))
+        # Mode-independent -- stay reachable in both Collect and Review. No key
+        # binding: Q is a plain letter, so any handler for it fights the task and
+        # host entry fields, and quitting is not something to trigger by typing.
+        ttk.Button(bar, text="Quit", command=self._quit).grid(row=0, column=2, sticky="e", padx=(10, 0))
         ttk.Button(bar, text="STOP ALL", style="Danger.TButton", command=self._stop_all).grid(
             row=0, column=3, sticky="e", padx=(10, 0)
         )
@@ -618,8 +850,9 @@ class RobotAppBase(tk.Tk):
                 on_release()
             self._key_release_after[keysym] = self.after(40, actually_release)
 
-        self.bind(f"<KeyPress-{keysym}>", handle_press)
-        self.bind(f"<KeyRelease-{keysym}>", handle_release)
+        for bound in _keysym_variants(keysym):
+            self.bind(f"<KeyPress-{bound}>", handle_press)
+            self.bind(f"<KeyRelease-{bound}>", handle_release)
 
     def _focused_widget_wants_text(self):
         return isinstance(self.focus_get(), (ttk.Entry, ttk.Combobox))

@@ -198,12 +198,16 @@ class CameraStreamReceiver:
 
     @property
     def measured_fps(self):
-        """Rolling receive rate over the last _FPS_WINDOW frames."""
+        """Rolling receive rate over the last _FPS_WINDOW frames, decaying to zero.
+
+        Measured to *now*, for the reason CameraStream.measured_fps gives: a sender
+        that stopped must read as zero rather than as whatever it last managed.
+        """
         with self._lock:
             recent = self._recent
             if len(recent) < 2:
                 return 0.0
-            span = recent[-1] - recent[0]
+            span = time.monotonic() - recent[0]
             return (len(recent) - 1) / span if span > 0 else 0.0
 
     def stop(self):
