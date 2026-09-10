@@ -50,19 +50,27 @@ episodes, evenly spaced, copied frame for frame:
 ```sh
 python scripts/split_dataset.py \
     --src-repo-id lone/l_one_manipulation \
-    --train-repo-id lone/l_one_manipulation_rebalanced_train \
-    --eval-repo-id lone/l_one_manipulation_eval \
-    --eval-episodes 5
+    --train-repo-id lone/l_one_manipulation_train \
+    --eval-repo-id lone/l_one_manipulation_eval10 \
+    --eval-episodes 10
 ```
 
+Hold out **10 episodes, not 5**. Five is enough to see a trend in the eval loss
+but not to rank checkpoints a few thousand steps apart: on the 5-episode split
+the step-to-step noise was ±0.006, the same size as the differences being
+compared. Ten episodes out of 158 costs ~6% of the training frames and halves
+that noise.
+
 Run after every session, before training — teleop is bang-bang, so statistics
-estimated from recorded frames are degenerate:
+estimated from recorded frames are degenerate. Do **both** halves of the split:
 
 ```sh
-ID=lone/l_one_manipulation_rebalanced_train; ROOT=data/lerobot/$ID
-python scripts/fix_action_stats.py --root $ROOT
-python scripts/validate_dataset.py --repo-id $ID --root $ROOT
-python scripts/inspect_dataset.py  --repo-id $ID --root $ROOT
+for ID in lone/l_one_manipulation_train lone/l_one_manipulation_eval10; do
+  ROOT=data/lerobot/$ID
+  python scripts/fix_action_stats.py --root $ROOT
+  python scripts/validate_dataset.py --repo-id $ID --root $ROOT
+  python scripts/inspect_dataset.py  --repo-id $ID --root $ROOT
+done
 ```
 
 ## Training
@@ -76,11 +84,12 @@ memorization of the same session; and `--balance-actions`.
 hf auth login   # pi0.5 only: google/paligemma-3b-pt-224 is gated
 
 python scripts/train.py \
-  --dataset.repo_id=lone/l_one_manipulation_rebalanced_train \
-  --dataset.root=data/lerobot/lone/l_one_manipulation_rebalanced_train \
-  --eval-dataset.repo-id=lone/l_one_manipulation_eval \
-  --eval-dataset.root=data/lerobot/lone/l_one_manipulation_eval \
-  --eval_steps=5000 \
+  --dataset.repo_id=lone/l_one_manipulation_train \
+  --dataset.root=data/lerobot/lone/l_one_manipulation_train \
+  --dataset.image_transforms.enable=true \
+  --eval-dataset.repo-id=lone/l_one_manipulation_eval10 \
+  --eval-dataset.root=data/lerobot/lone/l_one_manipulation_eval10 \
+  --eval_steps=10000 \
   --balance-actions \
   --policy.type=pi05 \
   --policy.pretrained_path=lerobot/pi05_base \
@@ -89,15 +98,25 @@ python scripts/train.py \
   --policy.freeze_vision_encoder=true --policy.train_expert_only=true \
   --policy.dtype=bfloat16 --policy.device=cuda \
   --batch_size=8 --num_workers=8 \
-  --steps=250000 --policy.scheduler_decay_steps=250000 \
-  --save_freq=50000 \
+  --steps=75000 --policy.scheduler_decay_steps=75000 \
+  --save_freq=10000 \
   --wandb.enable=true --wandb.project=lone --wandb.disable_artifact=true
 ```
 
+About 4.7 hours on the RTX 5090 at 4.4 steps/s, peak 21.7 GB.
+
+- **`--dataset.image_transforms.enable=true`** turns on lerobot's augmentation:
+  small affine jitter plus brightness, contrast, saturation, hue and sharpness,
+  three of the six per sample. It is **off by default**, and leaving it off is
+  the single largest contributor to overfitting here — 693M trainable parameters
+  against 148 same-session episodes. It is also the only knob that attacks the
+  session-to-session shift (lighting, marker placement) that makes the real robot
+  do worse than the eval loss suggests. The held-out set is never augmented, so
+  the eval loss keeps scoring one fixed input distribution.
 - **`--balance-actions`** weights the training sampler so the five scenarios —
   base moving, upper arm moving, lower arm moving, gripper closed, no action —
-  are drawn equally often. Teleop's own diet is badly skewed (10.7% / 16.2% /
-  25.2% / 18.0% / 29.9% on the training split), and a policy can score well on
+  are drawn equally often. Teleop's own diet is badly skewed (9.4% / 17.1% /
+  24.5% / 20.9% / 28.1% on this training split), and a policy can score well on
   that by learning the marginals instead of the task. It balances by *sampling*,
   never by deleting frames: idle frames are real supervision, and a chunked
   policy trains on runs of consecutive actions, so cutting frames out of an
@@ -109,6 +128,12 @@ python scripts/train.py \
   intact, so this works the same for pi0.5 and for ACT's L1/MSE regression.
 - The two datasets must share a schema — same fps, same camera views, same
   action space.
+- **`--steps=75000` with `--save_freq=10000`, not 250k/50k.** A 250k run on this
+  data reached its best held-out loss at step 50k (0.166) and then climbed
+  steadily to 0.204 by step 170k, while the training loss kept falling from 0.17
+  to 0.105 — textbook overfitting, roughly 7 epochs in. Saving every 10k means a
+  checkpoint actually exists near the eval minimum; `last/` is not the best
+  checkpoint on a run that overfits, so pick by eval loss.
 - `--policy.scheduler_decay_steps` must track `--steps`; it defaults to 30000.
 - `--policy.normalization_mapping` must be passed as the whole dict.
 - `--policy.pretrained_path` loads weights only and resets the config, which is
@@ -125,9 +150,9 @@ held-out folder:
 
 ```sh
 python scripts/eval_policy.py \
-  --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
-  --repo-id lone/l_one_manipulation_eval \
-  --root data/lerobot/lone/l_one_manipulation_eval
+  --checkpoint outputs/train/<run>/checkpoints/<step>/pretrained_model \
+  --repo-id lone/l_one_manipulation_eval10 \
+  --root data/lerobot/lone/l_one_manipulation_eval10
 ```
 
 Read **balanced accuracy per dimension** first: teleop only ever emitted three
@@ -135,6 +160,11 @@ levels per channel, so a policy that ignores the image and emits one constant
 scores exactly chance (1/k) on it — which neither plain accuracy nor MSE does.
 Then the confusion matrix for any dimension near chance. `--json <path>` writes
 the same figures machine-readably.
+
+Score **every saved checkpoint**, not just `last/`. The training eval loss is a
+flow-matching loss with fresh noise and a fresh timestep drawn on every pass, so
+it is noisy at the ±0.006 level and is not the number to choose a checkpoint by.
+Balanced accuracy here is, and on a run that overfits the two disagree.
 
 ## Deployment
 
@@ -164,8 +194,8 @@ demonstration on the right, both views in each column:
 ```sh
 python deploy_policy_training_data_replay.py \
   --checkpoint outputs/train/<run>/checkpoints/last/pretrained_model \
-  --repo-id lone/l_one_manipulation_rebalanced_train \
-  --root data/lerobot/lone/l_one_manipulation_rebalanced_train
+  --repo-id lone/l_one_manipulation_train \
+  --root data/lerobot/lone/l_one_manipulation_train
 ```
 
 Run three configurations in order, each isolating a different failure:
