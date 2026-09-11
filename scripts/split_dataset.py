@@ -3,9 +3,9 @@
 
     python scripts/split_dataset.py \
         --src-repo-id lone/l_one_manipulation \
-        --train-repo-id lone/l_one_manipulation_rebalanced_train \
-        --eval-repo-id lone/l_one_manipulation_eval \
-        --eval-episodes 5
+        --train-repo-id lone/l_one_manipulation_train \
+        --eval-repo-id lone/l_one_manipulation_eval10 \
+        --eval-episodes 10
 
 Whole episodes go to one side or the other and every frame is copied verbatim --
 nothing is dropped, reordered or resampled. Both outputs are written frame by
@@ -18,23 +18,10 @@ anything if the policy has never seen anything from those demonstrations. Frames
 sampled out of episodes that are otherwise trained on measure memorization: the
 frame either side of a held-out one is nearly the same picture.
 
-WHY THIS DOES NOT TOUCH THE ACTION DISTRIBUTION
------------------------------------------------
-The recorded action distribution is skewed -- the base motor moves in 9.4% of
-frames while nothing moves at all in 48.9% of them. That is worth correcting, but
-not by deleting frames:
-
-  * Idle frames are real supervision. "Hold still here" is part of the task, and
-    the pauses carry the scene the policy has to recognize before it acts.
-  * pi0.5 trains on chunks of consecutive actions. Cutting frames out of an
-    episode leaves a uniform frame_index/fps grid whose frames were not adjacent
-    in real time, so every chunk spanning a cut teaches a compressed version of
-    the motion -- and at 25 Hz the policy would then execute it too fast.
-
-The balance is applied when sampling instead: `scripts/train.py --balance-actions`
-weights the training sampler so each scenario is drawn equally often. The dataset
-stays a faithful recording and the model still sees an even diet. See
-`ACTION_SCENARIOS` there for the five scenarios and how frames map onto them.
+Frames are never dropped to even out the skewed teleop action distribution. Idle
+frames are real supervision, and pi0.5 trains on chunks of consecutive actions:
+cutting frames out of an episode leaves chunks that span stretched, discontinuous
+time and teach the motion too fast.
 """
 
 import argparse

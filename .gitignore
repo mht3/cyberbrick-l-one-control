@@ -237,3 +237,4 @@ wandb/
 
 # Deployment runs: video, per-tick action log, run metadata
 results/
+analysis/
