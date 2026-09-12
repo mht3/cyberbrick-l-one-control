@@ -154,7 +154,7 @@ class CollectDataApp(RobotAppBase):
         self.link = None
         self.ap_ip = None
         self.wifi_kind = None
-        self.gripper_open = True
+        self.gripper_open = False
         self._pressed_keys = set()
         self._key_release_after = {}
         self._wifi_connect_generation = 0

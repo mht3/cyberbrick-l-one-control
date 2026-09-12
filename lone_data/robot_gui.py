@@ -797,7 +797,7 @@ class RobotAppBase(tk.Tk):
         gripper_row = ttk.Frame(body)
         gripper_row.grid(row=3, column=0, pady=(18, 0), sticky="w")
         ttk.Label(gripper_row, text="Gripper", width=12, style="JointName.TLabel").pack(side="left")
-        self.gripper_btn = ttk.Button(gripper_row, text="Close Clamp", command=self._toggle_gripper, width=16)
+        self.gripper_btn = ttk.Button(gripper_row, text="Open Clamp", command=self._toggle_gripper, width=16)
         self.gripper_btn.pack(side="left", padx=4)
         ttk.Label(gripper_row, text="Space", style="KeyHint.TLabel").pack(side="left", padx=(10, 0))
         return body
@@ -895,10 +895,12 @@ class RobotAppBase(tk.Tk):
         self._on_action_changed()
 
     def _sync_gripper_state(self):
-        self.bus.submit(f"servo_angle:{GRIPPER_SERVO}", "set_servo_angle", GRIPPER_SERVO, GRIPPER_OPEN_ANGLE)
-        self.gripper_open = True
-        self.gripper_btn.config(text="Close Clamp")
-        self._reset_action_state(reopen_gripper=True)
+        # Closed on connect, as it always physically was -- recorded episodes start
+        # from this, so it stays put even though the constants' names were fixed.
+        self.bus.submit(f"servo_angle:{GRIPPER_SERVO}", "set_servo_angle", GRIPPER_SERVO, GRIPPER_CLOSED_ANGLE)
+        self.gripper_open = False
+        self.gripper_btn.config(text="Open Clamp")
+        self._reset_action_state(reset_gripper=True)
 
     def _toggle_gripper(self):
         if not self._require_link():
@@ -910,15 +912,15 @@ class RobotAppBase(tk.Tk):
         self._on_action_changed()
         self.gripper_btn.config(text="Open Clamp" if not self.gripper_open else "Close Clamp")
 
-    def _reset_action_state(self, reopen_gripper):
+    def _reset_action_state(self, reset_gripper):
         # Reaches into JointControl's internals -- no public reset() exists upstream.
         for jc in (self.base_control, self.upper_control, self.lower_control):
             jc._pos_sources.clear()
             jc._neg_sources.clear()
             jc._current = 0
         self._current_action[0:3] = 0.0
-        if reopen_gripper:
-            self._current_action[3] = float(GRIPPER_OPEN_ANGLE)
+        if reset_gripper:
+            self._current_action[3] = float(GRIPPER_CLOSED_ANGLE)
         self._on_action_changed()
 
     def _stop_all(self):
@@ -930,7 +932,7 @@ class RobotAppBase(tk.Tk):
         self._log("Stopped all joints.", level="info")
         # stop_all() bypasses JointControl, so a still-held key could desync afterward.
         self._on_emergency_stop()
-        self._reset_action_state(reopen_gripper=False)
+        self._reset_action_state(reset_gripper=False)
 
     def _held_speeds(self):
         """(base, upper, lower) speeds currently in force, for the heartbeat.

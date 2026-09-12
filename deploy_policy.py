@@ -358,9 +358,9 @@ class PolicyRunner:
         self._frame_meta = None
         self._running = False
         self._thread = None
-        # Bumped per run so a worker that outlived its stop() -- join() times out
+        # Bumped by every stop() so a worker that outlived it -- join() times out
         # while an inference is still in flight -- cannot push actions into the
-        # next run's queue or report its error against it.
+        # queue after it was cleared, or report its error against the next run.
         self._generation = 0
         self.last_latency = None
         self.error = None
@@ -398,13 +398,17 @@ class PolicyRunner:
         self.policy.init_rtc_processor()
         self.rtc_enabled = bool(rtc["enabled"])
 
+    # How long stop() waits for an in-flight inference. A worker still running past
+    # it is retired by its generation instead, so this bounds only how long a stop
+    # blocks the GUI, not whether the stop is clean.
+    STOP_JOIN_TIMEOUT_S = 3.0
+
     def start(self, task):
         """Serve actions for `task`, from a clean queue. Reusable across runs."""
         self.stop()
         self.task = task
         self.error = None
         with self._lock:
-            self._generation += 1
             generation = self._generation
             self.last_latency = None
         self._running = True
@@ -414,9 +418,15 @@ class PolicyRunner:
     def stop(self):
         self._running = False
         if self._thread is not None:
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=self.STOP_JOIN_TIMEOUT_S)
             self._thread = None
         with self._lock:
+            # Retire the worker in the same critical section that empties the
+            # queue. A join that timed out leaves an inference running; when it
+            # lands it must find its generation gone. Bumping only in start()
+            # left the whole stopped interval open, and the chunk it wrote --
+            # predicted from the old run's frame -- led the next run's queue.
+            self._generation += 1
             # Actions predicted from the old run's frames must not survive into
             # the next one, and a stale frame must not seed its first inference.
             # The chunk mirror goes with them: guiding a new run's first chunk
@@ -591,7 +601,7 @@ class DeployApp(RobotAppBase):
         self.link = None
         self.ap_ip = None
         self.wifi_kind = None
-        self.gripper_open = True
+        self.gripper_open = False
         self._pressed_keys = set()
         self._key_release_after = {}
         self._wifi_connect_generation = 0
@@ -1107,7 +1117,7 @@ class DeployApp(RobotAppBase):
             if self.runner is not None:
                 self.runner.stop()  # the loaded weights stay, for the next run
         # The policy left the arm wherever it was; manual state must agree.
-        self._reset_action_state(reopen_gripper=False)
+        self._reset_action_state(reset_gripper=False)
         self._set_policy_buttons_state()
         self._update_status_label()
         self._log(f"Policy {reason} -- back to manual control.", level="warn")

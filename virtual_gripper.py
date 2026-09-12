@@ -25,8 +25,10 @@ UPPER_ARM_SERVO = 1   # PWM1 - continuous "speed"-type servo
 LOWER_ARM_SERVO = 2   # PWM2 - continuous "speed"-type servo
 GRIPPER_SERVO = 3     # PWM3 - positional "angle"-type servo (0-180)
 
-GRIPPER_OPEN_ANGLE = 30
-GRIPPER_CLOSED_ANGLE = 120
+# Checked against the side camera: the jaws straddle the marker at 120 and hold
+# it at 30. The names were once the other way round, which swapped every label.
+GRIPPER_OPEN_ANGLE = 120
+GRIPPER_CLOSED_ANGLE = 30
 JOINT_SPEED = 100  # ServosController.set_speed range: -100..100 (bbl/servos.py) -- full power
 MOTOR_SPEED = 900  # MotorsController.set_speed range: -2048..2048 (bbl/motors.py)
 
@@ -397,7 +399,7 @@ class ControllerApp(tk.Tk):
         self.link = None
         self.ap_ip = None
         self.wifi_kind = None  # "ap" or "sta" -- which wifi_bridge.py brought up
-        self.gripper_open = True
+        self.gripper_open = False
         self._pressed_keys = set()
         self._key_release_after = {}
         # Bumped on every _connect_wifi() call so a slow/retrying attempt
@@ -783,7 +785,7 @@ class ControllerApp(tk.Tk):
         ttk.Label(gripper_row, text="Gripper", width=12, style="JointName.TLabel").pack(side="left")
         self.gripper_btn = ttk.Button(
             gripper_row,
-            text="Close Clamp",
+            text="Open Clamp",
             command=self._toggle_gripper,
             width=16,
         )
@@ -950,16 +952,16 @@ class ControllerApp(tk.Tk):
             self._log(f"Command failed: {e}", level="error")
 
     def _sync_gripper_state(self):
-        """Force the clamp open and reset tracked state to match, right
+        """Force the clamp closed and reset tracked state to match, right
         after connecting -- self.gripper_open's initial guess has no idea
         what position the board actually booted/was left in, so without
         this the button's label can be wrong until clicked twice."""
         try:
-            self.link.set_servo_angle(GRIPPER_SERVO, GRIPPER_OPEN_ANGLE)
+            self.link.set_servo_angle(GRIPPER_SERVO, GRIPPER_CLOSED_ANGLE)
         except Exception:
             return
-        self.gripper_open = True
-        self.gripper_btn.config(text="Close Clamp")
+        self.gripper_open = False
+        self.gripper_btn.config(text="Open Clamp")
 
     def _toggle_gripper(self):
         if not self._require_link():

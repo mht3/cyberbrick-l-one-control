@@ -160,8 +160,8 @@ python deploy_policy.py --checkpoint outputs/train/<run>/checkpoints/last/pretra
 ```
 
 Connect over Serial or WiFi, teleoperate the arm to a start pose, confirm the
-task prompt, then hand over to the policy. **STOP ALL** and `<space>` stop the
-arm at any time. Each run writes `results/deploy_<timestamp>/` with
+task prompt, then hand over to the policy. **STOP ALL** and **Stop Policy** stop
+the arm at any time; `<space>` only toggles the gripper. Each run writes `results/deploy_<timestamp>/` with
 `video_cam1.mp4` (and `video_cam2.mp4`), `actions.jsonl` and `run.json`.
 
 - The task prompt is prefilled from the checkpoint — pi0.5 conditions on it, so
@@ -219,7 +219,7 @@ panes agree before pressing Start.
 | 0 | `base_motor_speed` | MOTOR1 | -900 / 0 / 900 | -2048..2048 raw PWM |
 | 1 | `upper_arm_servo_speed` | PWM1 | -100 / 0 / 100 | -100..100 percent |
 | 2 | `lower_arm_servo_speed` | PWM2 | -100 / 0 / 100 | -100..100 percent |
-| 3 | `gripper_angle` | PWM3 | 30 / 120 | 0..180 degrees |
+| 3 | `gripper_angle` | PWM3 | 30 closed / 120 open | 0..180 degrees |
 
 `0` on dims 0-2 is dispatched as `stop_motor()`/`stop_servo()`, not
 `set_speed(idx, 0)` — different hardware states, and any replay has to reproduce

@@ -155,7 +155,7 @@ ACTION_COMMAND_LIMITS = [
     (-900.0, 900.0),  # base_motor_speed      -- virtual_gripper.MOTOR_SPEED
     (-100.0, 100.0),  # upper_arm_servo_speed -- virtual_gripper.JOINT_SPEED
     (-100.0, 100.0),  # lower_arm_servo_speed -- virtual_gripper.JOINT_SPEED
-    (30.0, 120.0),    # gripper_angle         -- OPEN_ANGLE .. CLOSED_ANGLE
+    (30.0, 120.0),    # gripper_angle         -- CLOSED_ANGLE .. OPEN_ANGLE
 ]
 
 # The discrete levels teleop actually emits on each channel. Every action in every
@@ -183,7 +183,7 @@ ACTION_LEVELS = [
     (-900.0, 0.0, 900.0),  # base_motor_speed      -- reverse / stop / forward
     (-100.0, 0.0, 100.0),  # upper_arm_servo_speed -- down / stop / up
     (-100.0, 0.0, 100.0),  # lower_arm_servo_speed -- down / stop / up
-    (30.0, 120.0),         # gripper_angle         -- open / closed
+    (30.0, 120.0),         # gripper_angle         -- closed / open
 ]
 
 # Short labels for the levels above, in the same order, for confusion matrices.
@@ -191,7 +191,7 @@ ACTION_LEVEL_LABELS = [
     ("-900", "0", "+900"),
     ("-100", "0", "+100"),
     ("-100", "0", "+100"),
-    ("open", "closed"),
+    ("closed", "open"),
 ]
 
 

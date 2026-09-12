@@ -37,6 +37,13 @@ class CommandBus:
         self._link = None
         self._pending = OrderedDict()  # key -> (method, args, enqueued_monotonic, droppable)
         self._cond = threading.Condition()
+        # Held by the worker from taking a command off the queue until the board
+        # answers it, and by send_now() for its whole call. Without it a stop has
+        # no ordering guarantee against a command the worker already popped: that
+        # command lands *after* the stop and the joint drives on -- until the WiFi
+        # deadman fires, or indefinitely over serial, whose link has no lock of its
+        # own and would interleave the two raw-REPL exchanges on the port besides.
+        self._send_lock = threading.Lock()
         self._running = False
         self._thread = None
         self._on_error = on_error
@@ -81,14 +88,22 @@ class CommandBus:
 
     def send_now(self, method, *args):
         """Dispatches on the caller's thread, bypassing the queue. For stops and
-        teardown, where blocking is fine and actually stopping matters more."""
+        teardown, where blocking is fine and actually stopping matters more.
+
+        Waits out a command the worker already has in flight, so after
+        cancel_pending() nothing queued before this call can reach the board
+        after it."""
         link = self._link
         if link is None:
             return
-        try:
-            getattr(link, method)(*args)
-        except Exception as e:
-            self._dispatch_error(f"{method}{args}: {e}", e)
+        error = None
+        with self._send_lock:
+            try:
+                getattr(link, method)(*args)
+            except Exception as e:
+                error = e
+        if error is not None:
+            self._dispatch_error(f"{method}{args}: {error}", error)
 
     def _run(self):
         while True:
@@ -99,19 +114,32 @@ class CommandBus:
                     if not self._running:
                         return
                     continue
-                _key, (method, args, queued_at, droppable) = self._pending.popitem(last=False)
-                link = self._link
 
-            if link is None:
-                continue
-            if droppable and time.monotonic() - queued_at > _MAX_COMMAND_AGE:
+            error = None
+            with self._send_lock:
                 with self._cond:
-                    self._dropped += 1
-                continue
-            try:
-                getattr(link, method)(*args)
-            except Exception as e:
-                self._dispatch_error(f"{method}{args}: {e}", e)
+                    # Re-checked under the send lock: a cancel_pending() while this
+                    # thread waited for send_now() to finish has emptied the queue.
+                    if not self._pending:
+                        continue
+                    _key, (method, args, queued_at, droppable) = self._pending.popitem(last=False)
+                    link = self._link
+
+                if link is None:
+                    continue
+                if droppable and time.monotonic() - queued_at > _MAX_COMMAND_AGE:
+                    with self._cond:
+                        self._dropped += 1
+                    continue
+                try:
+                    getattr(link, method)(*args)
+                except Exception as e:
+                    error = e
+
+            # Reported outside the send lock: on_link_dead belongs to the owner,
+            # and it may well want to send a stop of its own.
+            if error is not None:
+                self._dispatch_error(f"{method}{args}: {error}", error)
                 continue
 
             with self._cond:
