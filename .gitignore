@@ -238,3 +238,5 @@ wandb/
 # Deployment runs: video, per-tick action log, run metadata
 results/
 analysis/
+# Tracker repos cloned by scripts/setup_track_env.sh (pinned commits)
+third_party/
